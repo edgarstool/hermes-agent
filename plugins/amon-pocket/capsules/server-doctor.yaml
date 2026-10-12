@@ -1,0 +1,37 @@
+schema_version: edgar.product.v0
+capsule:
+  id: server-doctor
+  name: Server Doctor
+  version: 0.1.0
+  domain: infrastructure
+  status: scaffold
+  summary: "Diagnose EDGAR service health, explain incidents, and gate repair actions."
+  actions:
+    status:
+      risk: low
+      policy: ALLOW
+      mode: read_only
+    diagnose:
+      risk: low
+      policy: ALLOW
+      mode: read_only
+    repair:
+      risk: high
+      policy: OWNER_CONFIRM
+      mode: mutate
+  views:
+    line:
+      renderer: flex
+      status: planned
+    app:
+      resource_uri: ui://server-doctor/status
+      status: planned
+  execution:
+    runtime: hermes
+    approval_engine: hermes
+    delivery_ledger: hermes
+    task_ledger: reuse_before_build
+  bindings:
+    status: null
+    diagnose: null
+    repair: null
