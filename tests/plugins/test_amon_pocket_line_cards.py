@@ -1,0 +1,109 @@
+"""LINE card grammar tests for Amon Pocket Server Doctor."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
+
+_REPO = Path(__file__).resolve().parents[2]
+_PLUGIN = _REPO / "plugins" / "amon-pocket" / "__init__.py"
+
+
+def _load_plugin():
+    spec = importlib.util.spec_from_file_location("test_amon_pocket_cards", _PLUGIN)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _actions(card: dict) -> list[dict]:
+    footer = card["contents"].get("footer", {})
+    items = footer.get("contents", [])
+    return [json.loads(item["action"]["data"]) for item in items if item.get("type") == "button"]
+
+
+def test_incident_card_exposes_diagnose_action_without_shell():
+    plugin = _load_plugin()
+    card = plugin.build_server_doctor_incident_card(
+        service="hermes-gateway.service",
+        state="failed",
+        summary="Gateway is not responding",
+        scope="user",
+    )
+
+    assert card["type"] == "flex"
+    assert "Server Doctor" in card["altText"]
+    actions = _actions(card)
+    assert len(actions) == 1
+    assert actions[0] == {
+        "action": "amon_capsule",
+        "capsule_id": "server-doctor",
+        "capsule_action": "diagnose",
+        "service": "hermes-gateway.service",
+        "scope": "user",
+    }
+    assert "command" not in actions[0]
+
+
+def test_diagnostic_card_can_offer_guarded_repair():
+    plugin = _load_plugin()
+    card = plugin.build_server_doctor_diagnostic_card(
+        service="hermes-gateway.service",
+        diagnosis="Service exited unexpectedly",
+        evidence=["active: failed", "last log: address already in use"],
+        recommendation="Restart after confirming the port owner.",
+        repair_recommended=True,
+        scope="user",
+    )
+
+    actions = _actions(card)
+    assert [a["capsule_action"] for a in actions] == ["status", "repair"]
+    repair = actions[1]
+    assert repair["action"] == "amon_capsule"
+    assert repair["service"] == "hermes-gateway.service"
+    assert repair["scope"] == "user"
+    assert "command" not in repair
+
+
+def test_diagnostic_card_hides_repair_when_not_recommended():
+    plugin = _load_plugin()
+    card = plugin.build_server_doctor_diagnostic_card(
+        service="hermes-gateway.service",
+        diagnosis="Healthy",
+        evidence=["active: active"],
+        recommendation="No action required.",
+        repair_recommended=False,
+    )
+    assert [a["capsule_action"] for a in _actions(card)] == ["status"]
+
+
+def test_result_card_has_no_mutating_action_and_shows_verification():
+    plugin = _load_plugin()
+    card = plugin.build_server_doctor_result_card(
+        service="hermes-gateway.service",
+        action="repair",
+        success=True,
+        summary="Service restarted",
+        verification="active",
+    )
+
+    assert card["type"] == "flex"
+    assert _actions(card) == []
+    body_text = json.dumps(card["contents"]["body"], ensure_ascii=False)
+    assert "active" in body_text
+    assert "Service restarted" in body_text
+
+
+def test_card_builder_rejects_unbounded_service_name():
+    plugin = _load_plugin()
+    import pytest
+
+    with pytest.raises(ValueError, match="service"):
+        plugin.build_server_doctor_incident_card(
+            service="hermes; echo injected",
+            state="failed",
+            summary="bad",
+        )

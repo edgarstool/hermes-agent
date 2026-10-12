@@ -203,6 +203,219 @@ def make_server_doctor_handler(ctx):
     return _handle
 
 
+
+def _clip_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "?"
+
+
+def _server_doctor_postback(
+    *,
+    capsule_action: str,
+    service: str,
+    scope: str,
+) -> str:
+    service = _normalize_service_name(service)
+    scope = str(scope or "user").strip().lower()
+    if scope not in _SERVER_DOCTOR_SCOPES:
+        raise ValueError(f"unknown scope: {scope or '<empty>'}")
+    if capsule_action not in _SERVER_DOCTOR_ACTIONS:
+        raise ValueError(f"unknown action: {capsule_action}")
+    return json.dumps(
+        {
+            "action": "amon_capsule",
+            "capsule_id": "server-doctor",
+            "capsule_action": capsule_action,
+            "service": service,
+            "scope": scope,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _line_action_button(
+    *,
+    label: str,
+    capsule_action: str,
+    service: str,
+    scope: str,
+    style: str = "secondary",
+) -> Dict[str, Any]:
+    return {
+        "type": "button",
+        "style": style,
+        "action": {
+            "type": "postback",
+            "label": _clip_text(label, 20),
+            "data": _server_doctor_postback(
+                capsule_action=capsule_action,
+                service=service,
+                scope=scope,
+            ),
+            "displayText": _clip_text(label, 300),
+        },
+    }
+
+
+def _line_bubble(
+    *,
+    alt_text: str,
+    title: str,
+    body_contents: list[Dict[str, Any]],
+    footer_contents: Optional[list[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    bubble: Dict[str, Any] = {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": _clip_text(title, 200),
+                    "weight": "bold",
+                    "size": "lg",
+                    "wrap": True,
+                }
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": body_contents,
+        },
+    }
+    if footer_contents:
+        bubble["footer"] = {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": footer_contents,
+        }
+    return {
+        "type": "flex",
+        "altText": _clip_text(alt_text, 400),
+        "contents": bubble,
+    }
+
+
+def build_server_doctor_incident_card(
+    *,
+    service: str,
+    state: str,
+    summary: str,
+    scope: str = "user",
+) -> Dict[str, Any]:
+    """Build the first Server Doctor surface: incident ? diagnose."""
+    service = _normalize_service_name(service)
+    state = _clip_text(state or "unknown", 120)
+    summary = _clip_text(summary or "No incident summary available.", 1200)
+    return _line_bubble(
+        alt_text=f"Server Doctor: {service} incident",
+        title="?? Server Doctor ? Incident",
+        body_contents=[
+            {"type": "text", "text": service, "weight": "bold", "wrap": True},
+            {"type": "text", "text": f"state: {state}", "size": "sm", "wrap": True},
+            {"type": "separator"},
+            {"type": "text", "text": summary, "wrap": True},
+        ],
+        footer_contents=[
+            _line_action_button(
+                label="?? ??",
+                capsule_action="diagnose",
+                service=service,
+                scope=scope,
+                style="primary",
+            )
+        ],
+    )
+
+
+def build_server_doctor_diagnostic_card(
+    *,
+    service: str,
+    diagnosis: str,
+    evidence: list[str],
+    recommendation: str,
+    repair_recommended: bool,
+    scope: str = "user",
+) -> Dict[str, Any]:
+    """Build diagnosis evidence + bounded next actions without embedding shell."""
+    service = _normalize_service_name(service)
+    diagnosis = _clip_text(diagnosis or "Unknown", 1000)
+    recommendation = _clip_text(recommendation or "No recommendation.", 1000)
+    evidence_lines = [_clip_text(item, 500) for item in (evidence or [])[:5] if str(item).strip()]
+    evidence_text = "\n".join(f"? {line}" for line in evidence_lines) or "? No evidence captured"
+    footer = [
+        _line_action_button(
+            label="? ????",
+            capsule_action="status",
+            service=service,
+            scope=scope,
+        )
+    ]
+    if repair_recommended:
+        footer.append(
+            _line_action_button(
+                label="?? ??",
+                capsule_action="repair",
+                service=service,
+                scope=scope,
+                style="primary",
+            )
+        )
+    return _line_bubble(
+        alt_text=f"Server Doctor: {service} diagnosis",
+        title="?? Server Doctor ? Diagnostic",
+        body_contents=[
+            {"type": "text", "text": service, "weight": "bold", "wrap": True},
+            {"type": "text", "text": diagnosis, "wrap": True},
+            {"type": "separator"},
+            {"type": "text", "text": "Evidence", "weight": "bold", "size": "sm"},
+            {"type": "text", "text": evidence_text, "wrap": True, "size": "sm"},
+            {"type": "separator"},
+            {"type": "text", "text": recommendation, "wrap": True, "size": "sm"},
+        ],
+        footer_contents=footer,
+    )
+
+
+def build_server_doctor_result_card(
+    *,
+    service: str,
+    action: str,
+    success: bool,
+    summary: str,
+    verification: str,
+) -> Dict[str, Any]:
+    """Build a terminal result surface; result cards never contain mutating actions."""
+    service = _normalize_service_name(service)
+    action = str(action or "").strip().lower()
+    if action not in _SERVER_DOCTOR_ACTIONS:
+        raise ValueError(f"unknown action: {action or '<empty>'}")
+    status_text = "? ??" if success else "?? ???"
+    return _line_bubble(
+        alt_text=f"Server Doctor: {service} result",
+        title="?? Server Doctor ? Result",
+        body_contents=[
+            {"type": "text", "text": service, "weight": "bold", "wrap": True},
+            {"type": "text", "text": f"{status_text} ? {action}", "wrap": True},
+            {"type": "separator"},
+            {"type": "text", "text": _clip_text(summary, 1200), "wrap": True},
+            {
+                "type": "text",
+                "text": f"verification: {_clip_text(verification or 'unknown', 700)}",
+                "wrap": True,
+                "size": "sm",
+            },
+        ],
+    )
+
+
 def _help_text() -> str:
     return (
         "Amon Pocket v0\n"
