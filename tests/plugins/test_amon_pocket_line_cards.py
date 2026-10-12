@@ -38,6 +38,8 @@ def test_incident_card_exposes_diagnose_action_without_shell():
     assert "Server Doctor" in card["altText"]
     actions = _actions(card)
     assert len(actions) == 1
+    footer_button = card["contents"]["footer"]["contents"][0]
+    assert "\u8a3a\u65b7" in footer_button["action"]["label"]
     assert actions[0] == {
         "action": "amon_capsule",
         "capsule_id": "server-doctor",
@@ -122,7 +124,7 @@ def test_product_view_compiler_turns_failed_status_into_incident_card():
     assert view["version"] == "edgar.product-view.v0"
     assert view["capsule_id"] == "server-doctor"
     assert view["line"]["type"] == "flex"
-    assert "Incident" in view["line"]["contents"]["header"]["contents"][0]["text"]
+    assert "\u7570\u5e38" in view["line"]["contents"]["header"]["contents"][0]["text"]
     assert [a["capsule_action"] for a in _actions(view["line"])] == ["diagnose"]
     assert view["app"]["resource_uri"] == "ui://server-doctor/status"
     assert view["app"]["structured_content"]["success"] is False
@@ -137,12 +139,15 @@ def test_product_view_compiler_turns_repair_success_into_terminal_result_card():
         execution={"output": "active", "exit_code": 0, "error": None},
     )
 
-    assert "Result" in view["line"]["contents"]["header"]["contents"][0]["text"]
+    assert "\u7d50\u679c" in view["line"]["contents"]["header"]["contents"][0]["text"]
     assert _actions(view["line"]) == []
+    body = json.dumps(view["line"]["contents"]["body"], ensure_ascii=False)
+    assert "\u4fee\u5fa9" in body
+    assert "repair" not in body
     assert view["app"]["structured_content"]["success"] is True
 
 
-def test_product_view_compiler_keeps_diagnosis_read_only_without_evidence_for_repair():
+def test_product_view_compiler_offers_guarded_repair_after_diagnosis():
     plugin = _load_plugin()
     view = plugin.compile_server_doctor_product_view(
         action="diagnose",
@@ -155,8 +160,9 @@ def test_product_view_compiler_keeps_diagnosis_read_only_without_evidence_for_re
         },
     )
 
-    assert "Diagnostic" in view["line"]["contents"]["header"]["contents"][0]["text"]
-    assert [a["capsule_action"] for a in _actions(view["line"])] == ["status"]
+    assert "\u8a3a\u65b7" in view["line"]["contents"]["header"]["contents"][0]["text"]
+    assert [a["capsule_action"] for a in _actions(view["line"])] == ["status", "repair"]
+    assert "?" not in json.dumps(view["line"], ensure_ascii=False)
     structured = view["app"]["structured_content"]
     assert structured["action"] == "diagnose"
     assert structured["evidence"][0] == "Active: failed"

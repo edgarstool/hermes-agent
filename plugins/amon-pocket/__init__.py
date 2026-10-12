@@ -323,22 +323,22 @@ def build_server_doctor_incident_card(
     summary: str,
     scope: str = "user",
 ) -> Dict[str, Any]:
-    """Build the first Server Doctor surface: incident ? diagnose."""
+    """Build the first Server Doctor surface: incident to diagnose."""
     service = _normalize_service_name(service)
     state = _clip_text(state or "unknown", 120)
-    summary = _clip_text(summary or "No incident summary available.", 1200)
+    summary = _clip_text(summary or "\u6c92\u6709\u53ef\u7528\u7684\u7570\u5e38\u6458\u8981\u3002", 1200)
     return _line_bubble(
-        alt_text=f"Server Doctor: {service} incident",
-        title="?? Server Doctor ? Incident",
+        alt_text=f"Server Doctor\uff1a{service} \u7570\u5e38",
+        title="\U0001fa7a Server Doctor \u00b7 \u7570\u5e38",
         body_contents=[
             {"type": "text", "text": service, "weight": "bold", "wrap": True},
-            {"type": "text", "text": f"state: {state}", "size": "sm", "wrap": True},
+            {"type": "text", "text": f"\u72c0\u614b\uff1a{state}", "size": "sm", "wrap": True},
             {"type": "separator"},
             {"type": "text", "text": summary, "wrap": True},
         ],
         footer_contents=[
             _line_action_button(
-                label="?? ??",
+                label="\U0001f50e \u9032\u884c\u8a3a\u65b7",
                 capsule_action="diagnose",
                 service=service,
                 scope=scope,
@@ -359,13 +359,13 @@ def build_server_doctor_diagnostic_card(
 ) -> Dict[str, Any]:
     """Build diagnosis evidence + bounded next actions without embedding shell."""
     service = _normalize_service_name(service)
-    diagnosis = _clip_text(diagnosis or "Unknown", 1000)
-    recommendation = _clip_text(recommendation or "No recommendation.", 1000)
+    diagnosis = _clip_text(diagnosis or "\u672a\u77e5", 1000)
+    recommendation = _clip_text(recommendation or "\u66ab\u7121\u5efa\u8b70\u3002", 1000)
     evidence_lines = [_clip_text(item, 500) for item in (evidence or [])[:5] if str(item).strip()]
-    evidence_text = "\n".join(f"? {line}" for line in evidence_lines) or "? No evidence captured"
+    evidence_text = "\n".join(f"\u2022 {line}" for line in evidence_lines) or "\u2022 \u672a\u64f7\u53d6\u5230\u8b49\u64da"
     footer = [
         _line_action_button(
-            label="? ????",
+            label="\U0001f504 \u91cd\u65b0\u6aa2\u67e5",
             capsule_action="status",
             service=service,
             scope=scope,
@@ -374,7 +374,7 @@ def build_server_doctor_diagnostic_card(
     if repair_recommended:
         footer.append(
             _line_action_button(
-                label="?? ??",
+                label="\U0001f6e0\ufe0f \u8981\u6c42\u4fee\u5fa9",
                 capsule_action="repair",
                 service=service,
                 scope=scope,
@@ -382,13 +382,13 @@ def build_server_doctor_diagnostic_card(
             )
         )
     return _line_bubble(
-        alt_text=f"Server Doctor: {service} diagnosis",
-        title="?? Server Doctor ? Diagnostic",
+        alt_text=f"Server Doctor\uff1a{service} \u8a3a\u65b7",
+        title="\U0001fa7a Server Doctor \u00b7 \u8a3a\u65b7",
         body_contents=[
             {"type": "text", "text": service, "weight": "bold", "wrap": True},
             {"type": "text", "text": diagnosis, "wrap": True},
             {"type": "separator"},
-            {"type": "text", "text": "Evidence", "weight": "bold", "size": "sm"},
+            {"type": "text", "text": "\u8b49\u64da", "weight": "bold", "size": "sm"},
             {"type": "text", "text": evidence_text, "wrap": True, "size": "sm"},
             {"type": "separator"},
             {"type": "text", "text": recommendation, "wrap": True, "size": "sm"},
@@ -410,18 +410,20 @@ def build_server_doctor_result_card(
     action = str(action or "").strip().lower()
     if action not in _SERVER_DOCTOR_ACTIONS:
         raise ValueError(f"unknown action: {action or '<empty>'}")
-    status_text = "? ??" if success else "?? ???"
+    status_text = "\u2705 \u6210\u529f" if success else "\u26a0\ufe0f \u672a\u6210\u529f"
+    action_label = {"status": "\u72c0\u614b\u6aa2\u67e5", "diagnose": "\u8a3a\u65b7", "repair": "\u4fee\u5fa9"}[action]
+    verification_text = _clip_text(verification or "\u672a\u77e5", 700)
     return _line_bubble(
-        alt_text=f"Server Doctor: {service} result",
-        title="?? Server Doctor ? Result",
+        alt_text=f"Server Doctor\uff1a{service} \u7d50\u679c",
+        title="\U0001fa7a Server Doctor \u00b7 \u7d50\u679c",
         body_contents=[
             {"type": "text", "text": service, "weight": "bold", "wrap": True},
-            {"type": "text", "text": f"{status_text} ? {action}", "wrap": True},
+            {"type": "text", "text": f"{status_text} \u00b7 {action_label}", "wrap": True},
             {"type": "separator"},
             {"type": "text", "text": _clip_text(summary, 1200), "wrap": True},
             {
                 "type": "text",
-                "text": f"verification: {_clip_text(verification or 'unknown', 700)}",
+                "text": f"\u9a57\u8b49\uff1a{verification_text}",
                 "wrap": True,
                 "size": "sm",
             },
@@ -471,12 +473,12 @@ def compile_server_doctor_product_view(
     evidence = _execution_evidence(execution)
     status = str(execution.get("status") or "").strip()
     error = str(execution.get("error") or "").strip()
-    summary = error or (evidence[0] if evidence else status or "No output")
+    summary = error or (evidence[0] if evidence else status or "\u7121\u8f38\u51fa")
 
     if action == "status" and not success:
         line_view = build_server_doctor_incident_card(
             service=service,
-            state=status or "unhealthy",
+            state=status or "\u7570\u5e38",
             summary=summary,
             scope=scope,
         )
@@ -484,13 +486,13 @@ def compile_server_doctor_product_view(
         line_view = build_server_doctor_diagnostic_card(
             service=service,
             diagnosis=(
-                "Diagnostics collected."
+                "\u5df2\u6536\u96c6\u8a3a\u65b7\u8cc7\u6599\u3002"
                 if success
-                else "Diagnostics did not complete successfully."
+                else "\u8a3a\u65b7\u672a\u5b8c\u6574\u5b8c\u6210\u3002"
             ),
             evidence=evidence,
-            recommendation="Review the evidence before choosing a repair action.",
-            repair_recommended=False,
+            recommendation="\u8acb\u5148\u67e5\u770b\u8b49\u64da\uff1b\u82e5\u4f60\u6c7a\u5b9a\u4fee\u5fa9\uff0c\u4ecd\u6703\u8981\u6c42\u6838\u51c6\u3002",
+            repair_recommended=True,
             scope=scope,
         )
     else:
