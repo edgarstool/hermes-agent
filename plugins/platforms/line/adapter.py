@@ -596,6 +596,93 @@ def build_postback_button_message(
     }
 
 
+
+def build_exec_approval_flex_message(
+    command: str,
+    description: str,
+    approval_id: str,
+) -> Dict[str, Any]:
+    """Build a LINE Flex card for Hermes' existing dangerous-command approval."""
+    cmd_preview = str(command or "")
+    if len(cmd_preview) > 1200:
+        cmd_preview = cmd_preview[:1197] + "..."
+    reason = str(description or "dangerous command")
+    if len(reason) > 500:
+        reason = reason[:497] + "..."
+
+    def _button(label: str, choice: str, *, style: str = "secondary") -> Dict[str, Any]:
+        return {
+            "type": "button",
+            "style": style,
+            "action": {
+                "type": "postback",
+                "label": label,
+                "data": json.dumps(
+                    {
+                        "action": "exec_approval",
+                        "choice": choice,
+                        "approval_id": approval_id,
+                    },
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                "displayText": label,
+            },
+        }
+
+    return {
+        "type": "flex",
+        "altText": "\u26a0\ufe0f \u547d\u4ee4\u9700\u8981\u6838\u51c6",
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": "\u26a0\ufe0f \u547d\u4ee4\u9700\u8981\u6838\u51c6",
+                        "weight": "bold",
+                        "size": "lg",
+                        "wrap": True,
+                    }
+                ],
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "md",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": cmd_preview or "(\u7a7a\u767d\u547d\u4ee4)",
+                        "wrap": True,
+                        "size": "sm",
+                    },
+                    {"type": "separator"},
+                    {
+                        "type": "text",
+                        "text": f"\u539f\u56e0\uff1a{reason}",
+                        "wrap": True,
+                        "size": "sm",
+                    },
+                ],
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    _button("\u2705 \u6838\u51c6\u4e00\u6b21", "once", style="primary"),
+                    _button("\u2705 \u672c\u6b21\u5de5\u4f5c\u968e\u6bb5", "session"),
+                    _button("\U0001F512 \u6c38\u4e45\u6838\u51c6", "always"),
+                    _button("\u274c \u62d2\u7d55", "deny"),
+                ],
+            },
+        },
+    }
+
+
 # Prefixes the gateway uses for system busy-acks (interrupting / queued /
 # steered). When the postback cache has a PENDING entry we *bypass* the
 # cache for these so they reach the user as visible bubbles instead of
@@ -735,6 +822,9 @@ class LineAdapter(BasePlatformAdapter):
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
+
+        # Correlation only; tools.approval remains the approval source of truth.
+        self._approval_state: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1006,7 +1096,15 @@ class LineAdapter(BasePlatformAdapter):
         except (TypeError, json.JSONDecodeError):
             return
 
-        if parsed.get("action") != "show_response":
+        action = parsed.get("action")
+        if action == "exec_approval":
+            await self._handle_exec_approval_postback(
+                parsed=parsed,
+                chat_id=chat_id,
+                reply_token=reply_token,
+            )
+            return
+        if action != "show_response":
             return
         request_id = parsed.get("request_id", "")
         if not request_id:
@@ -1052,6 +1150,88 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+
+    async def _send_postback_notice(
+        self,
+        chat_id: str,
+        reply_token: str,
+        text: str,
+    ) -> None:
+        """Reply to a LINE postback, falling back to Push if Reply fails."""
+        if not self._client:
+            return
+        messages = [_text_message(text)]
+        if reply_token:
+            try:
+                await self._client.reply(reply_token, messages)
+                return
+            except Exception as exc:
+                logger.info("LINE: postback reply failed (%s); falling back to push", exc)
+        if chat_id:
+            try:
+                await self._client.push(chat_id, messages)
+            except Exception as exc:
+                logger.warning("LINE: postback notice push failed: %s", exc)
+
+    async def _handle_exec_approval_postback(
+        self,
+        *,
+        parsed: Dict[str, Any],
+        chat_id: str,
+        reply_token: str,
+    ) -> None:
+        """Resolve a LINE approval button through Hermes' existing approval engine."""
+        choice = str(parsed.get("choice", "")).strip().lower()
+        approval_id = str(parsed.get("approval_id", "")).strip()
+        if choice not in {"once", "session", "always", "deny"} or not approval_id:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u7121\u6548\u7684\u6838\u51c6\u64cd\u4f5c",
+            )
+            return
+
+        state = self._approval_state.get(approval_id)
+        if not state or state.get("chat_id") != chat_id:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u6b64\u6838\u51c6\u5df2\u8655\u7406\u6216\u5931\u6548\uff0c\u8acb\u91cd\u65b0\u8981\u6c42\u6838\u51c6\u3002",
+            )
+            return
+
+        state = self._approval_state.pop(approval_id)
+        session_key = str(state.get("session_key", ""))
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            count = resolve_gateway_approval(session_key, choice)
+        except Exception as exc:
+            logger.error("LINE: failed to resolve gateway approval: %s", exc)
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26a0\ufe0f \u6838\u51c6\u8655\u7406\u5931\u6557\uff0c\u8acb\u91cd\u65b0\u8981\u6c42\u6838\u51c6\u3002",
+            )
+            return
+
+        if count <= 0:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u6b64\u6838\u51c6\u5df2\u8655\u7406\u6216\u5931\u6548\uff0c\u8acb\u91cd\u65b0\u8981\u6c42\u6838\u51c6\u3002",
+            )
+            return
+
+        labels = {
+            "once": "\u2705 \u5df2\u6838\u51c6\u4e00\u6b21",
+            "session": "\u2705 \u672c\u6b21\u5de5\u4f5c\u968e\u6bb5\u5df2\u6838\u51c6",
+            "always": "\u2705 \u5df2\u6c38\u4e45\u6838\u51c6",
+            "deny": "\u274c \u5df2\u62d2\u7d55",
+        }
+        await self._send_postback_notice(chat_id, reply_token, labels[choice])
+        self.resume_typing_for_chat(chat_id)
+
     async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
         if not self._client or not message_id:
             return None
@@ -1075,6 +1255,35 @@ class LineAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Outbound send (text)
     # ------------------------------------------------------------------
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Present a Hermes dangerous-command approval as a LINE Flex card."""
+        if not self._client:
+            return SendResult(success=False, error="LINE adapter not connected")
+
+        approval_id = uuid.uuid4().hex
+        self._approval_state[approval_id] = {
+            "session_key": session_key,
+            "chat_id": chat_id,
+            "created_at": time.time(),
+        }
+        message = build_exec_approval_flex_message(
+            command=command,
+            description=description,
+            approval_id=approval_id,
+        )
+        result = await self._send_messages(chat_id, [message])
+        if not result.success:
+            self._approval_state.pop(approval_id, None)
+            return result
+        return SendResult(success=True, message_id=approval_id)
 
     async def send(
         self,
