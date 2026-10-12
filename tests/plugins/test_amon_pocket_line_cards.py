@@ -160,3 +160,10 @@ def test_product_view_compiler_keeps_diagnosis_read_only_without_evidence_for_re
     structured = view["app"]["structured_content"]
     assert structured["action"] == "diagnose"
     assert structured["evidence"][0] == "Active: failed"
+
+
+def test_card_text_truncation_uses_ellipsis_not_question_mark():
+    plugin = _load_plugin()
+    clipped = plugin._clip_text("x" * 30, 10)
+    assert clipped == "xxxxxxxxx\u2026"
+    assert "?" not in clipped

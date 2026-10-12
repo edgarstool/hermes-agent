@@ -221,7 +221,7 @@ def _clip_text(value: Any, limit: int) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
         return text
-    return text[: max(0, limit - 1)].rstrip() + "?"
+    return text[: max(0, limit - 1)].rstrip() + "\u2026"
 
 
 def _server_doctor_postback(

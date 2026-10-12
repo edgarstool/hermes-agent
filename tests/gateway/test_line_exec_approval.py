@@ -181,3 +181,32 @@ def test_send_exec_approval_cleans_state_when_delivery_fails():
 
     assert result.success is False
     assert adapter._approval_state == {}
+
+
+def test_exec_approval_group_requires_individually_allowlisted_user():
+    adapter = _adapter()
+    adapter.allowed_groups.add("Cops")
+    adapter._approval_state["approval-group"] = {
+        "session_key": "agent:main:line:group:Cops:Uowner",
+        "chat_id": "Cops",
+    }
+    action = {
+        "action": "exec_approval",
+        "choice": "once",
+        "approval_id": "approval-group",
+    }
+    event = {
+        "type": "postback",
+        "replyToken": "fresh-reply",
+        "source": {"type": "group", "groupId": "Cops", "userId": "Ustranger"},
+        "postback": {"data": json.dumps(action, separators=(",", ":"))},
+    }
+
+    with patch("tools.approval.resolve_gateway_approval") as resolve:
+        asyncio.run(adapter._handle_postback_event(event))
+
+    resolve.assert_not_called()
+    assert "approval-group" in adapter._approval_state
+    token, messages = adapter._client.reply.await_args.args
+    assert token == "fresh-reply"
+    assert "\u6c92\u6709\u6b0a\u9650" in messages[0]["text"]

@@ -991,8 +991,12 @@ class LineAdapter(BasePlatformAdapter):
             return web.Response(status=400, text="bad json")
 
         events = payload.get("events", []) or []
-        for event in events:
-            task = asyncio.create_task(self._dispatch_event_safe(event))
+        if events:
+            # One tracked task per webhook payload preserves LINE's event order
+            # inside that payload while still acknowledging immediately. Running
+            # each event in its own task can race reply-token ownership for two
+            # events from the same chat.
+            task = asyncio.create_task(self._dispatch_events_safe(events))
             self._webhook_tasks.add(task)
             task.add_done_callback(self._webhook_tasks.discard)
 
@@ -1000,6 +1004,10 @@ class LineAdapter(BasePlatformAdapter):
         # execution, or other downstream work. Signature + JSON validation are
         # complete at this point; dispatch continues in tracked background tasks.
         return web.Response(status=200, text="ok")
+
+    async def _dispatch_events_safe(self, events: List[Dict[str, Any]]) -> None:
+        for event in events:
+            await self._dispatch_event_safe(event)
 
     async def _dispatch_event_safe(self, event: Dict[str, Any]) -> None:
         try:
@@ -1127,6 +1135,7 @@ class LineAdapter(BasePlatformAdapter):
                 parsed=parsed,
                 chat_id=chat_id,
                 reply_token=reply_token,
+                source=source,
             )
             return
         if action == "amon_capsule":
@@ -1299,8 +1308,23 @@ class LineAdapter(BasePlatformAdapter):
         parsed: Dict[str, Any],
         chat_id: str,
         reply_token: str,
+        source: Dict[str, Any],
     ) -> None:
         """Resolve a LINE approval button through Hermes' existing approval engine."""
+        # Group/room admission is broader than OWNER_CONFIRM. A group can be
+        # allowed to talk to the bot without granting every participant the
+        # authority to approve dangerous commands. In shared chats, require
+        # the clicker to be individually allowlisted as a user.
+        source_type = str(source.get("type", "")).strip().lower()
+        source_user_id = str(source.get("userId", "")).strip()
+        if source_type in {"group", "room"} and source_user_id not in self.allowed_users:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u4f60\u6c92\u6709\u6b0a\u9650\u5728\u9019\u500b\u804a\u5929\u5ba4\u6838\u51c6\u5371\u96aa\u547d\u4ee4\u3002",
+            )
+            return
+
         choice = str(parsed.get("choice", "")).strip().lower()
         approval_id = str(parsed.get("approval_id", "")).strip()
         if choice not in {"once", "session", "always", "deny"} or not approval_id:

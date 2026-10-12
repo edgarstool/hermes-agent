@@ -117,3 +117,43 @@ def test_disconnect_cancels_pending_webhook_dispatch_tasks():
         assert adapter._webhook_tasks == set()
 
     asyncio.run(scenario())
+
+
+def test_webhook_dispatches_one_payload_sequentially_in_background():
+    async def scenario():
+        adapter = _adapter()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        seen = []
+
+        async def dispatch(event):
+            event_id = event["webhookEventId"]
+            seen.append(f"start:{event_id}")
+            if event_id == "evt-1":
+                first_started.set()
+                await release_first.wait()
+            seen.append(f"done:{event_id}")
+
+        adapter._dispatch_event = dispatch
+        body = json.dumps(
+            {"events": [
+                {"type": "message", "webhookEventId": "evt-1"},
+                {"type": "message", "webhookEventId": "evt-2"},
+            ]}
+        ).encode()
+
+        response = await asyncio.wait_for(adapter._handle_webhook(_request(body)), timeout=0.1)
+        assert response.status == 200
+        await asyncio.wait_for(first_started.wait(), timeout=0.1)
+        await asyncio.sleep(0)
+
+        # The second event must not start until the first finishes. This keeps
+        # reply-token ownership and event order deterministic within one LINE payload.
+        assert seen == ["start:evt-1"]
+        assert len(adapter._webhook_tasks) == 1
+
+        release_first.set()
+        await asyncio.gather(*list(adapter._webhook_tasks))
+        assert seen == ["start:evt-1", "done:evt-1", "start:evt-2", "done:evt-2"]
+
+    asyncio.run(scenario())

@@ -204,7 +204,7 @@ class TestPlatformDefaults:
         """Signal, BlueBubbles, etc. default to 'off' tool progress."""
         from gateway.display_config import resolve_display_setting
 
-        for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk"):
+        for plat in ("signal", "line", "bluebubbles", "weixin", "wecom", "dingtalk"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
 
     def test_minimal_tier_platforms(self):
@@ -219,6 +219,7 @@ class TestPlatformDefaults:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "signal", "streaming") is False
+        assert resolve_display_setting({}, "line", "streaming") is False
         assert resolve_display_setting({}, "email", "streaming") is False
 
     def test_high_tier_streaming_defaults_to_none(self):
