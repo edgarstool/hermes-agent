@@ -9309,7 +9309,12 @@ def _verify_core_dependencies_installed(
             applicable.append(name)
             continue
         try:
-            if marker.evaluate():  # type: ignore[union-attr]
+            # Explicitly override sys_platform instead of trusting
+            # packaging's internally constructed default environment.  The
+            # updater may be evaluating markers for a target venv while tests
+            # or embedding code alter the active platform context; passing the
+            # value makes Windows-only / non-Windows deps deterministic.
+            if marker.evaluate(environment={"sys_platform": sys.platform}):  # type: ignore[union-attr]
                 applicable.append(name)
         except Exception:
             applicable.append(name)
