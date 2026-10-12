@@ -39,6 +39,9 @@ def test_server_doctor_manifest_is_thin_product_contract():
     assert capsule["execution"]["runtime"] == "hermes"
     assert capsule["execution"]["approval_engine"] == "hermes"
     assert capsule["execution"]["delivery_ledger"] == "hermes"
+    assert capsule["bindings"]["status"] == {"tool": "server_doctor", "action": "status"}
+    assert capsule["bindings"]["diagnose"] == {"tool": "server_doctor", "action": "diagnose"}
+    assert capsule["bindings"]["repair"] == {"tool": "server_doctor", "action": "repair"}
 
 
 def test_bot_command_registry_routes_repair_to_owner_confirm():
@@ -61,8 +64,8 @@ def test_amon_command_lists_capsule_and_refuses_to_fake_execution():
 
     repair = plugin.handle_amon_command("doctor repair")
     assert "OWNER_CONFIRM" in repair
-    assert "\u5c1a\u672a\u7d81\u5b9a\u57f7\u884c\u5668" in repair
-    assert "\u5df2\u57f7\u884c" not in repair
+    assert "server_doctor" in repair
+    assert "\u672a\u57f7\u884c\u4efb\u4f55\u4e3b\u6a5f\u64cd\u4f5c" in repair
 
 
 def test_register_exposes_single_amon_namespace_command():
@@ -77,3 +80,123 @@ def test_register_exposes_single_amon_namespace_command():
     assert "Amon Pocket" in entry["description"]
     assert entry["args_hint"] == "[capsules|doctor <status|diagnose|repair>]"
     assert "Server Doctor" in entry["handler"]("doctor")
+
+
+
+def test_server_doctor_command_builder_is_bounded_and_repair_is_guarded():
+    plugin = _load_plugin()
+    from tools.approval import detect_dangerous_command
+
+    status = plugin.build_server_doctor_command(
+        action="status", service="hermes-gateway.service", scope="user"
+    )
+    diagnose = plugin.build_server_doctor_command(
+        action="diagnose", service="hermes-gateway.service", scope="user"
+    )
+    repair = plugin.build_server_doctor_command(
+        action="repair", service="hermes-gateway.service", scope="user"
+    )
+
+    assert status == (
+        "systemctl --user is-active hermes-gateway.service; "
+        "systemctl --user status hermes-gateway.service --no-pager -n 30"
+    )
+    assert "journalctl --user -u hermes-gateway.service -n 120 --no-pager" in diagnose
+    assert repair == (
+        "systemctl --user restart hermes-gateway.service && "
+        "systemctl --user is-active hermes-gateway.service"
+    )
+    assert detect_dangerous_command(status)[0] is False
+    assert detect_dangerous_command(diagnose)[0] is False
+    assert detect_dangerous_command(repair)[0] is True
+
+
+def test_server_doctor_rejects_shell_injection_and_unknown_scope():
+    plugin = _load_plugin()
+    import pytest
+
+    with pytest.raises(ValueError, match="service"):
+        plugin.build_server_doctor_command(
+            action="status", service="hermes; echo injected", scope="user"
+        )
+    with pytest.raises(ValueError, match="scope"):
+        plugin.build_server_doctor_command(
+            action="status", service="hermes-gateway.service", scope="rootish"
+        )
+    with pytest.raises(ValueError, match="action"):
+        plugin.build_server_doctor_command(
+            action="shell", service="hermes-gateway.service", scope="user"
+        )
+
+
+def test_server_doctor_tool_delegates_to_existing_terminal_primitive():
+    plugin = _load_plugin()
+
+    class FakeCtx:
+        def __init__(self):
+            self.calls = []
+
+        def dispatch_tool(self, name, args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return '{"output":"active","exit_code":0,"error":null}'
+
+    ctx = FakeCtx()
+    handler = plugin.make_server_doctor_handler(ctx)
+    result = handler(
+        {
+            "action": "status",
+            "service": "hermes-gateway.service",
+            "scope": "user",
+        },
+        task_id="task-1",
+    )
+
+    assert ctx.calls == [
+        (
+            "terminal",
+            {
+                "command": (
+                    "systemctl --user is-active hermes-gateway.service; "
+                    "systemctl --user status hermes-gateway.service --no-pager -n 30"
+                ),
+                "timeout": 30,
+            },
+            {"task_id": "task-1"},
+        )
+    ]
+    payload = __import__("json").loads(result)
+    assert payload["capsule_id"] == "server-doctor"
+    assert payload["action"] == "status"
+    assert payload["execution"]["output"] == "active"
+
+
+def test_register_exposes_server_doctor_tool_without_shadowing_terminal():
+    plugin = _load_plugin()
+
+    class FakeCtx:
+        def __init__(self):
+            self.commands = []
+            self.tools = []
+
+        def register_command(self, *args, **kwargs):
+            self.commands.append((args, kwargs))
+
+        def register_tool(self, **kwargs):
+            self.tools.append(kwargs)
+
+        def dispatch_tool(self, *args, **kwargs):
+            raise AssertionError("registration must not execute tools")
+
+    ctx = FakeCtx()
+    plugin.register(ctx)
+
+    assert len(ctx.commands) == 1
+    assert ctx.commands[0][0][0] == "amon"
+    assert len(ctx.tools) == 1
+    tool = ctx.tools[0]
+    assert tool["name"] == "server_doctor"
+    assert tool["toolset"] == "amon-pocket"
+    assert tool.get("override", False) is False
+    props = tool["schema"]["parameters"]["properties"]
+    assert props["action"]["enum"] == ["status", "diagnose", "repair"]
+    assert props["scope"]["enum"] == ["user", "system"]

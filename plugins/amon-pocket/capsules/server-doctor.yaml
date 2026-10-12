@@ -4,7 +4,7 @@ capsule:
   name: Server Doctor
   version: 0.1.0
   domain: infrastructure
-  status: scaffold
+  status: bounded_execution
   summary: "Diagnose EDGAR service health, explain incidents, and gate repair actions."
   actions:
     status:
@@ -30,8 +30,15 @@ capsule:
     runtime: hermes
     approval_engine: hermes
     delivery_ledger: hermes
+    security_sink: terminal_guard
     task_ledger: reuse_before_build
   bindings:
-    status: null
-    diagnose: null
-    repair: null
+    status:
+      tool: server_doctor
+      action: status
+    diagnose:
+      tool: server_doctor
+      action: diagnose
+    repair:
+      tool: server_doctor
+      action: repair
