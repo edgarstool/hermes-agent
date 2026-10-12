@@ -9881,7 +9881,7 @@ class GatewayRunner:
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
                 product_view = agent_result.get("product_view")
-                if product_view and response and source.platform == Platform.LINE:
+                if product_view and response and getattr(source.platform, "value", "") == "line":
                     return MetadataReply(response, metadata={"product_view": product_view})
                 return None
 
@@ -17950,7 +17950,7 @@ class GatewayRunner:
             agent.tool_start_callback = (
                 voice_ack_callback if _voice_ack_guild[0] is not None else None
             )
-            agent.tool_complete_callback = _product_view_complete_callback
+            setattr(agent, "tool_complete_callback", _product_view_complete_callback)
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
