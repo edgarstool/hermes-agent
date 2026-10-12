@@ -194,6 +194,12 @@ def make_server_doctor_handler():
 
         doc = load_capsule_manifest("server-doctor")
         policy = doc["capsule"]["actions"][action]["policy"]
+        product_view = compile_server_doctor_product_view(
+            action=action,
+            service=service,
+            scope=scope,
+            execution=execution,
+        )
         return json.dumps(
             {
                 "capsule_id": "server-doctor",
@@ -202,6 +208,7 @@ def make_server_doctor_handler():
                 "scope": scope,
                 "policy": policy,
                 "execution": execution,
+                "product_view": product_view,
             },
             ensure_ascii=False,
         )
@@ -420,6 +427,101 @@ def build_server_doctor_result_card(
             },
         ],
     )
+
+
+
+def _execution_success(execution: Dict[str, Any]) -> bool:
+    error = execution.get("error")
+    status = str(execution.get("status") or "").strip().lower()
+    exit_code = execution.get("exit_code")
+    if error:
+        return False
+    if status in {"error", "blocked", "pending_approval", "disabled"}:
+        return False
+    return exit_code in {None, 0}
+
+
+def _execution_evidence(execution: Dict[str, Any]) -> list[str]:
+    output = str(execution.get("output") or "")
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if execution.get("error"):
+        lines.insert(0, str(execution["error"]).strip())
+    return lines[:5]
+
+
+def compile_server_doctor_product_view(
+    *,
+    action: str,
+    service: str,
+    scope: str,
+    execution: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compile one tool result into reusable LINE + future app product views."""
+    action = str(action or "").strip().lower()
+    service = _normalize_service_name(service)
+    scope = str(scope or "user").strip().lower()
+    if action not in _SERVER_DOCTOR_ACTIONS:
+        raise ValueError(f"unknown action: {action or '<empty>'}")
+    if scope not in _SERVER_DOCTOR_SCOPES:
+        raise ValueError(f"unknown scope: {scope or '<empty>'}")
+    if not isinstance(execution, dict):
+        execution = {"raw": str(execution)}
+
+    success = _execution_success(execution)
+    evidence = _execution_evidence(execution)
+    status = str(execution.get("status") or "").strip()
+    error = str(execution.get("error") or "").strip()
+    summary = error or (evidence[0] if evidence else status or "No output")
+
+    if action == "status" and not success:
+        line_view = build_server_doctor_incident_card(
+            service=service,
+            state=status or "unhealthy",
+            summary=summary,
+            scope=scope,
+        )
+    elif action == "diagnose":
+        line_view = build_server_doctor_diagnostic_card(
+            service=service,
+            diagnosis=(
+                "Diagnostics collected."
+                if success
+                else "Diagnostics did not complete successfully."
+            ),
+            evidence=evidence,
+            recommendation="Review the evidence before choosing a repair action.",
+            repair_recommended=False,
+            scope=scope,
+        )
+    else:
+        line_view = build_server_doctor_result_card(
+            service=service,
+            action=action,
+            success=success,
+            summary=summary,
+            verification=(evidence[-1] if evidence else status or "unknown"),
+        )
+
+    structured_content = {
+        "capsule_id": "server-doctor",
+        "action": action,
+        "service": service,
+        "scope": scope,
+        "success": success,
+        "status": status or None,
+        "exit_code": execution.get("exit_code"),
+        "summary": summary,
+        "evidence": evidence,
+    }
+    return {
+        "version": "edgar.product-view.v0",
+        "capsule_id": "server-doctor",
+        "line": line_view,
+        "app": {
+            "resource_uri": "ui://server-doctor/status",
+            "structured_content": structured_content,
+        },
+    }
 
 
 def _help_text() -> str:

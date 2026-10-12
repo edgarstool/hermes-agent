@@ -107,3 +107,56 @@ def test_card_builder_rejects_unbounded_service_name():
             state="failed",
             summary="bad",
         )
+
+
+
+def test_product_view_compiler_turns_failed_status_into_incident_card():
+    plugin = _load_plugin()
+    view = plugin.compile_server_doctor_product_view(
+        action="status",
+        service="hermes-gateway.service",
+        scope="user",
+        execution={"output": "inactive\nfailed", "exit_code": 3, "error": None},
+    )
+
+    assert view["version"] == "edgar.product-view.v0"
+    assert view["capsule_id"] == "server-doctor"
+    assert view["line"]["type"] == "flex"
+    assert "Incident" in view["line"]["contents"]["header"]["contents"][0]["text"]
+    assert [a["capsule_action"] for a in _actions(view["line"])] == ["diagnose"]
+    assert view["app"]["resource_uri"] == "ui://server-doctor/status"
+    assert view["app"]["structured_content"]["success"] is False
+
+
+def test_product_view_compiler_turns_repair_success_into_terminal_result_card():
+    plugin = _load_plugin()
+    view = plugin.compile_server_doctor_product_view(
+        action="repair",
+        service="hermes-gateway.service",
+        scope="user",
+        execution={"output": "active", "exit_code": 0, "error": None},
+    )
+
+    assert "Result" in view["line"]["contents"]["header"]["contents"][0]["text"]
+    assert _actions(view["line"]) == []
+    assert view["app"]["structured_content"]["success"] is True
+
+
+def test_product_view_compiler_keeps_diagnosis_read_only_without_evidence_for_repair():
+    plugin = _load_plugin()
+    view = plugin.compile_server_doctor_product_view(
+        action="diagnose",
+        service="hermes-gateway.service",
+        scope="user",
+        execution={
+            "output": "Active: failed\nMain PID: 123\naddress already in use",
+            "exit_code": 0,
+            "error": None,
+        },
+    )
+
+    assert "Diagnostic" in view["line"]["contents"]["header"]["contents"][0]["text"]
+    assert [a["capsule_action"] for a in _actions(view["line"])] == ["status"]
+    structured = view["app"]["structured_content"]
+    assert structured["action"] == "diagnose"
+    assert structured["evidence"][0] == "Active: failed"

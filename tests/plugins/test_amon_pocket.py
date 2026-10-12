@@ -164,6 +164,8 @@ def test_server_doctor_tool_uses_canonical_tool_dispatch_for_terminal():
     assert payload["capsule_id"] == "server-doctor"
     assert payload["action"] == "status"
     assert payload["execution"]["output"] == "active"
+    assert payload["product_view"]["version"] == "edgar.product-view.v0"
+    assert payload["product_view"]["line"]["type"] == "flex"
 
 
 def test_register_exposes_server_doctor_tool_without_shadowing_terminal():
