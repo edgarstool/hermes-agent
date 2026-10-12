@@ -826,6 +826,10 @@ class LineAdapter(BasePlatformAdapter):
         # Correlation only; tools.approval remains the approval source of truth.
         self._approval_state: Dict[str, Dict[str, Any]] = {}
 
+        # Verified webhook events are dispatched asynchronously so LINE gets
+        # a fast 2xx acknowledgement instead of waiting on media/agent work.
+        self._webhook_tasks: Set[asyncio.Task] = set()
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -914,6 +918,16 @@ class LineAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._mark_disconnected()
 
+        # Drain/cancel background webhook dispatch before tearing down client
+        # resources.  This prevents orphan tasks from touching a disconnected
+        # adapter during shutdown/restart.
+        pending_webhooks = list(self._webhook_tasks)
+        for task in pending_webhooks:
+            task.cancel()
+        if pending_webhooks:
+            await asyncio.gather(*pending_webhooks, return_exceptions=True)
+        self._webhook_tasks.clear()
+
         if self._site is not None:
             try:
                 await self._site.stop()
@@ -977,12 +991,22 @@ class LineAdapter(BasePlatformAdapter):
 
         events = payload.get("events", []) or []
         for event in events:
-            try:
-                await self._dispatch_event(event)
-            except Exception:
-                logger.exception("LINE: dispatch_event failed")
+            task = asyncio.create_task(self._dispatch_event_safe(event))
+            self._webhook_tasks.add(task)
+            task.add_done_callback(self._webhook_tasks.discard)
 
+        # LINE webhook acknowledgement must not wait for media download, agent
+        # execution, or other downstream work. Signature + JSON validation are
+        # complete at this point; dispatch continues in tracked background tasks.
         return web.Response(status=200, text="ok")
+
+    async def _dispatch_event_safe(self, event: Dict[str, Any]) -> None:
+        try:
+            await self._dispatch_event(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("LINE: dispatch_event failed")
 
     async def _dispatch_event(self, event: Dict[str, Any]) -> None:
         event_type = event.get("type")
