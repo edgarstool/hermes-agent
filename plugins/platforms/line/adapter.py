@@ -112,6 +112,7 @@ LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
+_AMON_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
@@ -1128,6 +1129,14 @@ class LineAdapter(BasePlatformAdapter):
                 reply_token=reply_token,
             )
             return
+        if action == "amon_capsule":
+            await self._handle_amon_capsule_postback(
+                parsed=parsed,
+                event=event,
+                chat_id=chat_id,
+                reply_token=reply_token,
+            )
+            return
         if action != "show_response":
             return
         request_id = parsed.get("request_id", "")
@@ -1174,6 +1183,93 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+
+
+    async def _handle_amon_capsule_postback(
+        self,
+        *,
+        parsed: Dict[str, Any],
+        event: Dict[str, Any],
+        chat_id: str,
+        reply_token: str,
+    ) -> None:
+        """Turn a bounded Amon card action back into a normal Hermes agent turn.
+
+        The adapter deliberately does not execute terminal commands here. It
+        validates a tiny intent envelope and injects a synthetic text event;
+        the agent must call ``server_doctor``, preserving normal tool policy
+        and dangerous-command approval for repairs.
+        """
+        allowed_keys = {
+            "action",
+            "capsule_id",
+            "capsule_action",
+            "service",
+            "scope",
+        }
+        if set(parsed) - allowed_keys:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u7121\u6548\u7684 Amon Pocket \u64cd\u4f5c",
+            )
+            return
+
+        capsule_id = str(parsed.get("capsule_id", "")).strip().lower()
+        capsule_action = str(parsed.get("capsule_action", "")).strip().lower()
+        service = str(parsed.get("service", "")).strip()
+        scope = str(parsed.get("scope", "user")).strip().lower()
+        if (
+            capsule_id != "server-doctor"
+            or capsule_action not in {"status", "diagnose", "repair"}
+            or scope not in {"user", "system"}
+            or not service
+            or not _AMON_SERVICE_NAME_RE.fullmatch(service)
+        ):
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u7121\u6548\u7684 Amon Pocket \u64cd\u4f5c",
+            )
+            return
+
+        source = event.get("source") or {}
+        resolved_chat_id, chat_type = _resolve_chat(source)
+        if not resolved_chat_id or resolved_chat_id != chat_id:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u7121\u6548\u7684 Amon Pocket \u4f86\u6e90",
+            )
+            return
+        user_id = source.get("userId", "") or chat_id
+
+        if reply_token:
+            self._reply_tokens[chat_id] = (
+                reply_token,
+                time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
+            )
+
+        source_obj = self.build_source(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+            user_name=user_id,
+            chat_name=chat_id,
+        )
+        text = (
+            "[Amon Pocket] Use the server_doctor tool with exactly these bounded "
+            f"parameters: action={capsule_action} service={service} scope={scope}. "
+            "Do not execute arbitrary shell or substitute another command."
+        )
+        event_obj = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source_obj,
+            raw_message=event,
+            message_id=event.get("webhookEventId", "") or None,
+        )
+        await self.handle_message(event_obj)
 
     async def _send_postback_notice(
         self,
