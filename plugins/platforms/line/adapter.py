@@ -1415,6 +1415,15 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
+        # Product Views ride the normal Reply -> Push delivery path.  Validate
+        # the envelope before trusting platform-specific message JSON; invalid
+        # or future versions degrade to the ordinary text response.
+        product_view = (metadata or {}).get("product_view")
+        if isinstance(product_view, dict) and product_view.get("version") == "edgar.product-view.v0":
+            line_view = product_view.get("line")
+            if isinstance(line_view, dict) and line_view.get("type") == "flex":
+                return await self._send_messages(chat_id, [line_view])
+
         # System busy-acks (interrupting / queued / steered) bypass the
         # postback cache and route directly to LINE so they reach the user
         # as visible bubbles. Source: PR #18153.
