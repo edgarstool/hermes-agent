@@ -129,41 +129,37 @@ def test_server_doctor_rejects_shell_injection_and_unknown_scope():
         )
 
 
-def test_server_doctor_tool_delegates_to_existing_terminal_primitive():
+def test_server_doctor_tool_uses_canonical_tool_dispatch_for_terminal():
     plugin = _load_plugin()
+    from unittest.mock import patch
 
-    class FakeCtx:
-        def __init__(self):
-            self.calls = []
+    handler = plugin.make_server_doctor_handler()
+    with patch(
+        "model_tools.handle_function_call",
+        return_value='{"output":"active","exit_code":0,"error":null}',
+    ) as dispatch:
+        result = handler(
+            {
+                "action": "status",
+                "service": "hermes-gateway.service",
+                "scope": "user",
+            },
+            task_id="task-1",
+            user_task="check service",
+        )
 
-        def dispatch_tool(self, name, args, **kwargs):
-            self.calls.append((name, args, kwargs))
-            return '{"output":"active","exit_code":0,"error":null}'
-
-    ctx = FakeCtx()
-    handler = plugin.make_server_doctor_handler(ctx)
-    result = handler(
-        {
-            "action": "status",
-            "service": "hermes-gateway.service",
-            "scope": "user",
+    dispatch.assert_called_once_with(
+        function_name="terminal",
+        function_args={
+            "command": (
+                "systemctl --user is-active hermes-gateway.service; "
+                "systemctl --user status hermes-gateway.service --no-pager -n 30"
+            ),
+            "timeout": 30,
         },
         task_id="task-1",
+        user_task="check service",
     )
-
-    assert ctx.calls == [
-        (
-            "terminal",
-            {
-                "command": (
-                    "systemctl --user is-active hermes-gateway.service; "
-                    "systemctl --user status hermes-gateway.service --no-pager -n 30"
-                ),
-                "timeout": 30,
-            },
-            {"task_id": "task-1"},
-        )
-    ]
     payload = __import__("json").loads(result)
     assert payload["capsule_id"] == "server-doctor"
     assert payload["action"] == "status"

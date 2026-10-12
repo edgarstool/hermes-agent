@@ -135,7 +135,7 @@ def build_server_doctor_command(*, action: str, service: str, scope: str) -> str
     return f"{systemctl} restart {service} && {systemctl} is-active {service}"
 
 
-def make_server_doctor_handler(ctx):
+def make_server_doctor_handler():
     """Create the model-tool handler while keeping Hermes terminal authoritative."""
 
     def _handle(args: Dict[str, Any], **kwargs) -> str:
@@ -176,10 +176,16 @@ def make_server_doctor_handler(ctx):
                 )
 
         timeout = 30 if action == "status" else 60
-        raw = ctx.dispatch_tool(
-            "terminal",
-            {"command": command, "timeout": timeout},
-            **kwargs,
+        # Re-enter Hermes' canonical dispatcher instead of calling the registry
+        # directly. This preserves pre_tool_call policy hooks before terminal's
+        # own dangerous-command guard and approval flow.
+        from model_tools import handle_function_call
+
+        raw = handle_function_call(
+            function_name="terminal",
+            function_args={"command": command, "timeout": timeout},
+            task_id=kwargs.get("task_id"),
+            user_task=kwargs.get("user_task"),
         )
         try:
             execution = json.loads(raw)
@@ -475,7 +481,7 @@ def register(ctx) -> None:
         name="server_doctor",
         toolset="amon-pocket",
         schema=SERVER_DOCTOR_TOOL_SCHEMA,
-        handler=make_server_doctor_handler(ctx),
+        handler=make_server_doctor_handler(),
         description="Bounded Server Doctor Capsule execution via Hermes terminal.",
         emoji="\U0001FA7A",
         override=False,
