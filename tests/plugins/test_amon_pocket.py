@@ -119,6 +119,10 @@ def test_server_doctor_rejects_shell_injection_and_unknown_scope():
         plugin.build_server_doctor_command(
             action="status", service="hermes; echo injected", scope="user"
         )
+    with pytest.raises(ValueError, match="service"):
+        plugin.build_server_doctor_command(
+            action="status", service="--help.service", scope="user"
+        )
     with pytest.raises(ValueError, match="scope"):
         plugin.build_server_doctor_command(
             action="status", service="hermes-gateway.service", scope="rootish"

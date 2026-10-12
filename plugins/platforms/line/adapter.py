@@ -112,7 +112,7 @@ LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
-_AMON_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
+_AMON_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@:][A-Za-z0-9_.@:-]*$")
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON

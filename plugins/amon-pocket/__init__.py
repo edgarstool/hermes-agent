@@ -13,7 +13,7 @@ import yaml
 
 PRODUCT_MANIFEST_VERSION = "edgar.product.v0"
 _CAPSULE_DIR = Path(__file__).resolve().parent / "capsules"
-_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
+_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@:][A-Za-z0-9_.@:-]*$")
 _SERVER_DOCTOR_ACTIONS = {"status", "diagnose", "repair"}
 _SERVER_DOCTOR_SCOPES = {"user", "system"}
 _DEFAULT_SERVICE = "hermes-gateway.service"
@@ -43,7 +43,7 @@ SERVER_DOCTOR_TOOL_SCHEMA = {
             "service": {
                 "type": "string",
                 "default": _DEFAULT_SERVICE,
-                "pattern": r"^[A-Za-z0-9_.@:-]+$",
+                "pattern": r"^[A-Za-z0-9_.@:][A-Za-z0-9_.@:-]*$",
                 "description": "Bounded systemd unit name, never a shell fragment.",
             },
             "scope": {

@@ -109,6 +109,22 @@ def test_amon_postback_rejects_service_shell_injection():
     adapter._client.reply.assert_awaited_once()
 
 
+def test_amon_postback_rejects_option_like_service_name():
+    adapter = _adapter()
+    payload = {
+        "action": "amon_capsule",
+        "capsule_id": "server-doctor",
+        "capsule_action": "status",
+        "service": "--help.service",
+        "scope": "user",
+    }
+
+    asyncio.run(adapter._handle_postback_event(_event(payload)))
+
+    adapter.handle_message.assert_not_awaited()
+    adapter._client.reply.assert_awaited_once()
+
+
 def test_amon_postback_rejects_command_field_even_if_other_fields_valid():
     adapter = _adapter()
     payload = {
