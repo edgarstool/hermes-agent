@@ -48,3 +48,36 @@ async def test_line_send_invalid_product_view_falls_back_to_text():
     messages = client.replies[0][1]
     assert messages[0]["type"] == "text"
     assert messages[0]["text"] == "fallback text"
+
+@pytest.mark.asyncio
+async def test_line_product_view_uses_existing_slow_response_cache_until_postback():
+    adapter = LineAdapter(PlatformConfig(enabled=True, extra={"channel_access_token": "t", "channel_secret": "s"}))
+    client = FakeClient()
+    adapter._client = client
+    rid = adapter._cache.register_pending("U1")
+    adapter._pending_buttons["U1"] = rid
+    flex = {"type": "flex", "altText": "Doctor result", "contents": {"type": "bubble", "body": {"type": "box", "layout": "vertical", "contents": []}}}
+    metadata = {"product_view": {"version": "edgar.product-view.v0", "capsule_id": "server-doctor", "line": flex}}
+
+    result = await adapter.send("U1", "fallback text", metadata=metadata)
+
+    assert result.success is True
+    assert result.message_id == rid
+    assert client.replies == []
+    assert client.pushes == []
+    entry = adapter._cache.get(rid)
+    assert entry.state is _line.State.READY
+    assert entry.payload == {"kind": "line_message", "message": flex}
+
+    event = {
+        "type": "postback",
+        "replyToken": "fresh-reply",
+        "source": {"type": "user", "userId": "U1"},
+        "postback": {"data": __import__("json").dumps({"action": "show_response", "request_id": rid})},
+    }
+    await adapter._handle_postback_event(event)
+
+    assert client.replies == [("fresh-reply", [flex])]
+    assert client.pushes == []
+    assert adapter._cache.get(rid).state is _line.State.DELIVERED
+    assert "U1" not in adapter._pending_buttons

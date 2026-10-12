@@ -1158,8 +1158,16 @@ class LineAdapter(BasePlatformAdapter):
 
         if entry.state is State.READY:
             payload = entry.payload or ""
-            chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
-            messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+            cached_message = None
+            if isinstance(payload, dict) and payload.get("kind") == "line_message":
+                candidate = payload.get("message")
+                if isinstance(candidate, dict) and candidate.get("type") == "flex":
+                    cached_message = candidate
+            if cached_message is not None:
+                messages = [cached_message]
+            else:
+                chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
+                messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
             try:
                 await self._client.reply(reply_token, messages)
                 self._cache.mark_delivered(request_id)
@@ -1439,14 +1447,29 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
-        # Product Views ride the normal Reply -> Push delivery path.  Validate
+        # Product Views ride the normal Reply -> Push delivery path. Validate
         # the envelope before trusting platform-specific message JSON; invalid
         # or future versions degrade to the ordinary text response.
+        line_view = None
         product_view = (metadata or {}).get("product_view")
         if isinstance(product_view, dict) and product_view.get("version") == "edgar.product-view.v0":
-            line_view = product_view.get("line")
-            if isinstance(line_view, dict) and line_view.get("type") == "flex":
-                return await self._send_messages(chat_id, [line_view])
+            candidate = product_view.get("line")
+            if isinstance(candidate, dict) and candidate.get("type") == "flex":
+                line_view = candidate
+
+        # If the slow-response button already consumed the original reply token,
+        # keep the Product View in the existing READY cache. The user's later
+        # postback supplies a fresh reply token, preserving both the Flex UI and
+        # the free Reply path instead of leaving a stale PENDING button behind.
+        pending_rid = self._pending_buttons.get(chat_id)
+        if line_view is not None and pending_rid:
+            self._cache.set_ready(
+                pending_rid,
+                {"kind": "line_message", "message": line_view},
+            )
+            return SendResult(success=True, message_id=pending_rid)
+        if line_view is not None:
+            return await self._send_messages(chat_id, [line_view])
 
         # System busy-acks (interrupting / queued / steered) bypass the
         # postback cache and route directly to LINE so they reach the user
@@ -1456,7 +1479,6 @@ class LineAdapter(BasePlatformAdapter):
 
         # If the chat has a PENDING postback button outstanding, route the
         # response into the cache for the user to fetch via tap.
-        pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
             self._cache.set_ready(pending_rid, content)
             return SendResult(success=True, message_id=pending_rid)
