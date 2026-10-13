@@ -1,0 +1,4 @@
+name: amon-pocket
+version: 0.1.0
+description: "Thin EDGAR product layer for Hermes: Capsule discovery and namespaced Bot Mode commands."
+author: "edgarstool"

@@ -178,6 +178,53 @@ class TestVerifyCoreDependencies:
         )
         assert "pathspec" in probe, "core deps without markers must be checked"
 
+    def test_marker_eval_explicitly_overrides_stale_default_sys_platform(
+        self, temp_pyproject, fake_venv_python
+    ):
+        """Hermes must pass its current sys.platform into marker evaluation.
+
+        packaging builds a default environment internally.  Simulate that
+        environment being stale/Linux while Hermes is evaluating a Windows
+        target; ptyprocess must still be excluded.
+        """
+        py, venv_root = fake_venv_python
+        env = {"VIRTUAL_ENV": str(venv_root)}
+        captured_argv: list[list[str]] = []
+
+        def fake_subprocess_run(cmd, **kwargs):
+            captured_argv.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        stale_linux_env = {
+            "implementation_name": "cpython",
+            "implementation_version": "3.11.17",
+            "os_name": "posix",
+            "platform_machine": "x86_64",
+            "platform_release": "linux",
+            "platform_system": "Linux",
+            "platform_version": "linux",
+            "python_full_version": "3.11.17",
+            "platform_python_implementation": "CPython",
+            "python_version": "3.11",
+            "sys_platform": "linux",
+        }
+
+        with patch("hermes_cli.main._resolve_install_target_python", return_value=py), \
+             patch("hermes_cli.main.subprocess.run", side_effect=fake_subprocess_run), \
+             patch("hermes_cli.main._run_install_with_heartbeat"), \
+             patch("packaging.markers.default_environment", return_value=stale_linux_env), \
+             patch("sys.platform", "win32"):
+            from hermes_cli.main import _verify_core_dependencies_installed
+            _verify_core_dependencies_installed(["uv", "pip"], env=env)
+
+        probe = next(
+            (argv for argv in captured_argv if any("importlib.metadata" in str(a) for a in argv)),
+            None,
+        )
+        assert probe is not None
+        assert "ptyprocess" not in probe
+        assert "pathspec" in probe
+
     def test_no_pyproject_is_noop(self, tmp_path, monkeypatch):
         """If pyproject.toml is missing (unusual but possible in some test
         envs), the verification step must short-circuit, not crash."""

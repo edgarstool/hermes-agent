@@ -1554,6 +1554,19 @@ class SendResult:
     continuation_message_ids: tuple = ()
 
 
+class MetadataReply(str):
+    """String reply carrying platform metadata without changing handler contracts.
+
+    Adapters that understand a metadata key may render richer output while all
+    existing string-processing paths continue to see ordinary text.
+    """
+
+    def __new__(cls, content: str, *, metadata: Optional[Dict[str, Any]] = None):
+        obj = super().__new__(cls, content)
+        obj.metadata = dict(metadata or {})
+        return obj
+
+
 class EphemeralReply(str):
     """System-notice reply that auto-deletes after a TTL.
 
@@ -4072,6 +4085,11 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+            _response_metadata = (
+                dict(getattr(response, "metadata", {}) or {})
+                if isinstance(response, MetadataReply)
+                else {}
+            )
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -4220,9 +4238,11 @@ class BasePlatformAdapter(ABC):
                     # typing-indicator task (which must remain unmarked).
                     if _thread_metadata is not None:
                         _thread_metadata = dict(_thread_metadata)
-                        _thread_metadata["notify"] = True
                     else:
-                        _thread_metadata = {"notify": True}
+                        _thread_metadata = {}
+                    if _response_metadata:
+                        _thread_metadata.update(_response_metadata)
+                    _thread_metadata["notify"] = True
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,

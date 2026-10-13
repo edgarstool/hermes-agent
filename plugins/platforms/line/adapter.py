@@ -112,6 +112,7 @@ LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
+_AMON_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@:][A-Za-z0-9_.@:-]*$")
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
@@ -596,6 +597,93 @@ def build_postback_button_message(
     }
 
 
+
+def build_exec_approval_flex_message(
+    command: str,
+    description: str,
+    approval_id: str,
+) -> Dict[str, Any]:
+    """Build a LINE Flex card for Hermes' existing dangerous-command approval."""
+    cmd_preview = str(command or "")
+    if len(cmd_preview) > 1200:
+        cmd_preview = cmd_preview[:1197] + "..."
+    reason = str(description or "dangerous command")
+    if len(reason) > 500:
+        reason = reason[:497] + "..."
+
+    def _button(label: str, choice: str, *, style: str = "secondary") -> Dict[str, Any]:
+        return {
+            "type": "button",
+            "style": style,
+            "action": {
+                "type": "postback",
+                "label": label,
+                "data": json.dumps(
+                    {
+                        "action": "exec_approval",
+                        "choice": choice,
+                        "approval_id": approval_id,
+                    },
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                "displayText": label,
+            },
+        }
+
+    return {
+        "type": "flex",
+        "altText": "\u26a0\ufe0f \u547d\u4ee4\u9700\u8981\u6838\u51c6",
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": "\u26a0\ufe0f \u547d\u4ee4\u9700\u8981\u6838\u51c6",
+                        "weight": "bold",
+                        "size": "lg",
+                        "wrap": True,
+                    }
+                ],
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "md",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": cmd_preview or "(\u7a7a\u767d\u547d\u4ee4)",
+                        "wrap": True,
+                        "size": "sm",
+                    },
+                    {"type": "separator"},
+                    {
+                        "type": "text",
+                        "text": f"\u539f\u56e0\uff1a{reason}",
+                        "wrap": True,
+                        "size": "sm",
+                    },
+                ],
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    _button("\u2705 \u6838\u51c6\u4e00\u6b21", "once", style="primary"),
+                    _button("\u2705 \u672c\u6b21\u5de5\u4f5c\u968e\u6bb5", "session"),
+                    _button("\U0001F512 \u6c38\u4e45\u6838\u51c6", "always"),
+                    _button("\u274c \u62d2\u7d55", "deny"),
+                ],
+            },
+        },
+    }
+
+
 # Prefixes the gateway uses for system busy-acks (interrupting / queued /
 # steered). When the postback cache has a PENDING entry we *bypass* the
 # cache for these so they reach the user as visible bubbles instead of
@@ -736,6 +824,13 @@ class LineAdapter(BasePlatformAdapter):
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
 
+        # Correlation only; tools.approval remains the approval source of truth.
+        self._approval_state: Dict[str, Dict[str, Any]] = {}
+
+        # Verified webhook events are dispatched asynchronously so LINE gets
+        # a fast 2xx acknowledgement instead of waiting on media/agent work.
+        self._webhook_tasks: Set[asyncio.Task] = set()
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -824,6 +919,16 @@ class LineAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._mark_disconnected()
 
+        # Drain/cancel background webhook dispatch before tearing down client
+        # resources.  This prevents orphan tasks from touching a disconnected
+        # adapter during shutdown/restart.
+        pending_webhooks = list(self._webhook_tasks)
+        for task in pending_webhooks:
+            task.cancel()
+        if pending_webhooks:
+            await asyncio.gather(*pending_webhooks, return_exceptions=True)
+        self._webhook_tasks.clear()
+
         if self._site is not None:
             try:
                 await self._site.stop()
@@ -886,13 +991,31 @@ class LineAdapter(BasePlatformAdapter):
             return web.Response(status=400, text="bad json")
 
         events = payload.get("events", []) or []
-        for event in events:
-            try:
-                await self._dispatch_event(event)
-            except Exception:
-                logger.exception("LINE: dispatch_event failed")
+        if events:
+            # One tracked task per webhook payload preserves LINE's event order
+            # inside that payload while still acknowledging immediately. Running
+            # each event in its own task can race reply-token ownership for two
+            # events from the same chat.
+            task = asyncio.create_task(self._dispatch_events_safe(events))
+            self._webhook_tasks.add(task)
+            task.add_done_callback(self._webhook_tasks.discard)
 
+        # LINE webhook acknowledgement must not wait for media download, agent
+        # execution, or other downstream work. Signature + JSON validation are
+        # complete at this point; dispatch continues in tracked background tasks.
         return web.Response(status=200, text="ok")
+
+    async def _dispatch_events_safe(self, events: List[Dict[str, Any]]) -> None:
+        for event in events:
+            await self._dispatch_event_safe(event)
+
+    async def _dispatch_event_safe(self, event: Dict[str, Any]) -> None:
+        try:
+            await self._dispatch_event(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("LINE: dispatch_event failed")
 
     async def _dispatch_event(self, event: Dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -1006,7 +1129,24 @@ class LineAdapter(BasePlatformAdapter):
         except (TypeError, json.JSONDecodeError):
             return
 
-        if parsed.get("action") != "show_response":
+        action = parsed.get("action")
+        if action == "exec_approval":
+            await self._handle_exec_approval_postback(
+                parsed=parsed,
+                chat_id=chat_id,
+                reply_token=reply_token,
+                source=source,
+            )
+            return
+        if action == "amon_capsule":
+            await self._handle_amon_capsule_postback(
+                parsed=parsed,
+                event=event,
+                chat_id=chat_id,
+                reply_token=reply_token,
+            )
+            return
+        if action != "show_response":
             return
         request_id = parsed.get("request_id", "")
         if not request_id:
@@ -1018,8 +1158,16 @@ class LineAdapter(BasePlatformAdapter):
 
         if entry.state is State.READY:
             payload = entry.payload or ""
-            chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
-            messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+            cached_message = None
+            if isinstance(payload, dict) and payload.get("kind") == "line_message":
+                candidate = payload.get("message")
+                if isinstance(candidate, dict) and candidate.get("type") == "flex":
+                    cached_message = candidate
+            if cached_message is not None:
+                messages = [cached_message]
+            else:
+                chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
+                messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
             try:
                 await self._client.reply(reply_token, messages)
                 self._cache.mark_delivered(request_id)
@@ -1052,6 +1200,190 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+
+
+    async def _handle_amon_capsule_postback(
+        self,
+        *,
+        parsed: Dict[str, Any],
+        event: Dict[str, Any],
+        chat_id: str,
+        reply_token: str,
+    ) -> None:
+        """Turn a bounded Amon card action back into a normal Hermes agent turn.
+
+        The adapter deliberately does not execute terminal commands here. It
+        validates a tiny intent envelope and injects a synthetic text event;
+        the agent must call ``server_doctor``, preserving normal tool policy
+        and dangerous-command approval for repairs.
+        """
+        allowed_keys = {
+            "action",
+            "capsule_id",
+            "capsule_action",
+            "service",
+            "scope",
+        }
+        if set(parsed) - allowed_keys:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u7121\u6548\u7684 Amon Pocket \u64cd\u4f5c",
+            )
+            return
+
+        capsule_id = str(parsed.get("capsule_id", "")).strip().lower()
+        capsule_action = str(parsed.get("capsule_action", "")).strip().lower()
+        service = str(parsed.get("service", "")).strip()
+        scope = str(parsed.get("scope", "user")).strip().lower()
+        if (
+            capsule_id != "server-doctor"
+            or capsule_action not in {"status", "diagnose", "repair"}
+            or scope not in {"user", "system"}
+            or not service
+            or not _AMON_SERVICE_NAME_RE.fullmatch(service)
+        ):
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u7121\u6548\u7684 Amon Pocket \u64cd\u4f5c",
+            )
+            return
+
+        source = event.get("source") or {}
+        resolved_chat_id, chat_type = _resolve_chat(source)
+        if not resolved_chat_id or resolved_chat_id != chat_id:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u7121\u6548\u7684 Amon Pocket \u4f86\u6e90",
+            )
+            return
+        user_id = source.get("userId", "") or chat_id
+
+        if reply_token:
+            self._reply_tokens[chat_id] = (
+                reply_token,
+                time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
+            )
+
+        source_obj = self.build_source(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+            user_name=user_id,
+            chat_name=chat_id,
+        )
+        text = (
+            "[Amon Pocket] Use the server_doctor tool with exactly these bounded "
+            f"parameters: action={capsule_action} service={service} scope={scope}. "
+            "Do not execute arbitrary shell or substitute another command."
+        )
+        event_obj = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source_obj,
+            raw_message=event,
+            message_id=event.get("webhookEventId", "") or None,
+        )
+        await self.handle_message(event_obj)
+
+    async def _send_postback_notice(
+        self,
+        chat_id: str,
+        reply_token: str,
+        text: str,
+    ) -> None:
+        """Reply to a LINE postback, falling back to Push if Reply fails."""
+        if not self._client:
+            return
+        messages = [_text_message(text)]
+        if reply_token:
+            try:
+                await self._client.reply(reply_token, messages)
+                return
+            except Exception as exc:
+                logger.info("LINE: postback reply failed (%s); falling back to push", exc)
+        if chat_id:
+            try:
+                await self._client.push(chat_id, messages)
+            except Exception as exc:
+                logger.warning("LINE: postback notice push failed: %s", exc)
+
+    async def _handle_exec_approval_postback(
+        self,
+        *,
+        parsed: Dict[str, Any],
+        chat_id: str,
+        reply_token: str,
+        source: Dict[str, Any],
+    ) -> None:
+        """Resolve a LINE approval button through Hermes' existing approval engine."""
+        # Group/room admission is broader than OWNER_CONFIRM. A group can be
+        # allowed to talk to the bot without granting every participant the
+        # authority to approve dangerous commands. In shared chats, require
+        # the clicker to be individually allowlisted as a user.
+        source_type = str(source.get("type", "")).strip().lower()
+        source_user_id = str(source.get("userId", "")).strip()
+        if source_type in {"group", "room"} and source_user_id not in self.allowed_users:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u4f60\u6c92\u6709\u6b0a\u9650\u5728\u9019\u500b\u804a\u5929\u5ba4\u6838\u51c6\u5371\u96aa\u547d\u4ee4\u3002",
+            )
+            return
+
+        choice = str(parsed.get("choice", "")).strip().lower()
+        approval_id = str(parsed.get("approval_id", "")).strip()
+        if choice not in {"once", "session", "always", "deny"} or not approval_id:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26d4 \u7121\u6548\u7684\u6838\u51c6\u64cd\u4f5c",
+            )
+            return
+
+        state = self._approval_state.get(approval_id)
+        if not state or state.get("chat_id") != chat_id:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u6b64\u6838\u51c6\u5df2\u8655\u7406\u6216\u5931\u6548\uff0c\u8acb\u91cd\u65b0\u8981\u6c42\u6838\u51c6\u3002",
+            )
+            return
+
+        state = self._approval_state.pop(approval_id)
+        session_key = str(state.get("session_key", ""))
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            count = resolve_gateway_approval(session_key, choice)
+        except Exception as exc:
+            logger.error("LINE: failed to resolve gateway approval: %s", exc)
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u26a0\ufe0f \u6838\u51c6\u8655\u7406\u5931\u6557\uff0c\u8acb\u91cd\u65b0\u8981\u6c42\u6838\u51c6\u3002",
+            )
+            return
+
+        if count <= 0:
+            await self._send_postback_notice(
+                chat_id,
+                reply_token,
+                "\u6b64\u6838\u51c6\u5df2\u8655\u7406\u6216\u5931\u6548\uff0c\u8acb\u91cd\u65b0\u8981\u6c42\u6838\u51c6\u3002",
+            )
+            return
+
+        labels = {
+            "once": "\u2705 \u5df2\u6838\u51c6\u4e00\u6b21",
+            "session": "\u2705 \u672c\u6b21\u5de5\u4f5c\u968e\u6bb5\u5df2\u6838\u51c6",
+            "always": "\u2705 \u5df2\u6c38\u4e45\u6838\u51c6",
+            "deny": "\u274c \u5df2\u62d2\u7d55",
+        }
+        await self._send_postback_notice(chat_id, reply_token, labels[choice])
+        self.resume_typing_for_chat(chat_id)
+
     async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
         if not self._client or not message_id:
             return None
@@ -1076,6 +1408,35 @@ class LineAdapter(BasePlatformAdapter):
     # Outbound send (text)
     # ------------------------------------------------------------------
 
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Present a Hermes dangerous-command approval as a LINE Flex card."""
+        if not self._client:
+            return SendResult(success=False, error="LINE adapter not connected")
+
+        approval_id = uuid.uuid4().hex
+        self._approval_state[approval_id] = {
+            "session_key": session_key,
+            "chat_id": chat_id,
+            "created_at": time.time(),
+        }
+        message = build_exec_approval_flex_message(
+            command=command,
+            description=description,
+            approval_id=approval_id,
+        )
+        result = await self._send_messages(chat_id, [message])
+        if not result.success:
+            self._approval_state.pop(approval_id, None)
+            return result
+        return SendResult(success=True, message_id=approval_id)
+
     async def send(
         self,
         chat_id: str,
@@ -1086,6 +1447,30 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
+        # Product Views ride the normal Reply -> Push delivery path. Validate
+        # the envelope before trusting platform-specific message JSON; invalid
+        # or future versions degrade to the ordinary text response.
+        line_view = None
+        product_view = (metadata or {}).get("product_view")
+        if isinstance(product_view, dict) and product_view.get("version") == "edgar.product-view.v0":
+            candidate = product_view.get("line")
+            if isinstance(candidate, dict) and candidate.get("type") == "flex":
+                line_view = candidate
+
+        # If the slow-response button already consumed the original reply token,
+        # keep the Product View in the existing READY cache. The user's later
+        # postback supplies a fresh reply token, preserving both the Flex UI and
+        # the free Reply path instead of leaving a stale PENDING button behind.
+        pending_rid = self._pending_buttons.get(chat_id)
+        if line_view is not None and pending_rid:
+            self._cache.set_ready(
+                pending_rid,
+                {"kind": "line_message", "message": line_view},
+            )
+            return SendResult(success=True, message_id=pending_rid)
+        if line_view is not None:
+            return await self._send_messages(chat_id, [line_view])
+
         # System busy-acks (interrupting / queued / steered) bypass the
         # postback cache and route directly to LINE so they reach the user
         # as visible bubbles. Source: PR #18153.
@@ -1094,7 +1479,6 @@ class LineAdapter(BasePlatformAdapter):
 
         # If the chat has a PENDING postback button outstanding, route the
         # response into the cache for the user to fetch via tap.
-        pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
             self._cache.set_ready(pending_rid, content)
             return SendResult(success=True, message_id=pending_rid)

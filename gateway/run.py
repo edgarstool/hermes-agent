@@ -1134,6 +1134,7 @@ from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    MetadataReply,
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
@@ -1154,6 +1155,26 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_product_view_from_tool_result(tool_name: str, result: Any) -> Optional[Dict[str, Any]]:
+    """Return a validated Amon Product View from one tool result."""
+    if tool_name != "server_doctor":
+        return None
+    try:
+        payload = json.loads(result) if isinstance(result, str) else result
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    product_view = payload.get("product_view")
+    if not isinstance(product_view, dict):
+        return None
+    if product_view.get("version") != "edgar.product-view.v0":
+        return None
+    if product_view.get("capsule_id") != "server-doctor":
+        return None
+    return product_view
 
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -9859,8 +9880,14 @@ class GatewayRunner:
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                product_view = agent_result.get("product_view")
+                if product_view and response and getattr(source.platform, "value", "") == "line":
+                    return MetadataReply(response, metadata={"product_view": product_view})
                 return None
 
+            product_view = agent_result.get("product_view")
+            if product_view and response:
+                return MetadataReply(response, metadata={"product_view": product_view})
             return response
             
         except Exception as e:
@@ -17058,6 +17085,14 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        product_view_holder: List[Optional[Dict[str, Any]]] = [None]
+
+        def _product_view_complete_callback(call_id, tool_name, args, result):
+            if not _run_still_current():
+                return
+            product_view = _extract_product_view_from_tool_result(tool_name, result)
+            if product_view is not None:
+                product_view_holder[0] = product_view
 
         # ── Discord voice "verbal ack before tool calls" ────────────────
         # When the bot is in a voice channel with the continuous mixer
@@ -17915,6 +17950,7 @@ class GatewayRunner:
             agent.tool_start_callback = (
                 voice_ack_callback if _voice_ack_guild[0] is not None else None
             )
+            setattr(agent, "tool_complete_callback", _product_view_complete_callback)
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -18369,6 +18405,7 @@ class GatewayRunner:
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "product_view": product_view_holder[0],
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -18528,6 +18565,7 @@ class GatewayRunner:
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "product_view": product_view_holder[0],
             }
         
         # Start progress message sender if enabled
