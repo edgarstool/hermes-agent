@@ -259,6 +259,110 @@ class TestStartRun:
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
 
+    @pytest.mark.parametrize(
+        "heartbeat_input",
+        [
+            "[OpenClaw heartbeat poll]",
+            json.dumps(
+                {
+                    "previousRecap": "No meaningful change.",
+                    "messages": [
+                        "assistant: NO_REPLY",
+                        "user: [OpenClaw heartbeat poll]",
+                    ],
+                    "omittedContent": False,
+                },
+                ensure_ascii=False,
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_idle_openclaw_heartbeat_completes_without_agent(
+        self, adapter, heartbeat_input
+    ):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post("/v1/runs", json={"input": heartbeat_input})
+                assert resp.status == 202
+                data = await resp.json()
+                assert data["status"] == "completed"
+                assert data["run_id"].startswith("run_")
+                mock_create.assert_not_called()
+
+                status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
+                assert status_resp.status == 200
+                status = await status_resp.json()
+                assert status["status"] == "completed"
+                assert status["output"] == "NO_REPLY"
+                assert status["usage"] == {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                }
+                assert status["skip_reason"] == "idle_openclaw_heartbeat"
+
+    @pytest.mark.asyncio
+    async def test_idle_openclaw_heartbeat_idempotency_replays_same_zero_token_run(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        headers = {"Idempotency-Key": "openclaw-heartbeat-retry-1"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                first = await cli.post(
+                    "/v1/runs", json={"input": "[OpenClaw heartbeat poll]"}, headers=headers
+                )
+                second = await cli.post(
+                    "/v1/runs", json={"input": "[OpenClaw heartbeat poll]"}, headers=headers
+                )
+                assert first.status == 202
+                assert second.status == 202
+                first_data = await first.json()
+                second_data = await second.json()
+                assert first_data["run_id"] == second_data["run_id"]
+                assert first_data["status"] == "completed"
+                assert second_data["replayed"] is True
+                assert second.headers["Idempotency-Replayed"] == "true"
+                mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_openclaw_heartbeat_envelope_with_real_work_still_runs_agent(
+        self, adapter
+    ):
+        heartbeat_with_work = json.dumps(
+            {
+                "previousRecap": "Work remains.",
+                "messages": [
+                    "user: Continue EDG-442 and verify the deployment.",
+                    "user: [OpenClaw heartbeat poll]",
+                ],
+                "omittedContent": False,
+            },
+            ensure_ascii=False,
+        )
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": heartbeat_with_work})
+                assert resp.status == 202
+                data = await resp.json()
+                assert data["status"] == "started"
+                for _ in range(50):
+                    if mock_create.called:
+                        break
+                    await asyncio.sleep(0.01)
+                mock_create.assert_called()
+
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id

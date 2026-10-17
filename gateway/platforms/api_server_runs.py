@@ -559,6 +559,131 @@ def _drop_run_transport(self, run_id: str) -> None:
     )
 
 
+_IDLE_OPENCLAW_HEARTBEAT = "[OpenClaw heartbeat poll]"
+_IDLE_OPENCLAW_ALLOWED_MESSAGES = {
+    "assistant: NO_REPLY",
+    f"user: {_IDLE_OPENCLAW_HEARTBEAT}",
+}
+_ZERO_RUN_USAGE = {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+}
+
+
+def _is_idle_openclaw_heartbeat(user_message: Any) -> bool:
+    """Recognize only OpenClaw's no-work heartbeat forms, never mixed work payloads."""
+    if not isinstance(user_message, str):
+        return False
+    text = user_message.strip()
+    if text == _IDLE_OPENCLAW_HEARTBEAT:
+        return True
+    if not text.startswith("{"):
+        return False
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    normalized = [msg.strip() for msg in messages if isinstance(msg, str) and msg.strip()]
+    heartbeat = f"user: {_IDLE_OPENCLAW_HEARTBEAT}"
+    return (
+        normalized
+        and normalized[-1] == heartbeat
+        and all(msg in _IDLE_OPENCLAW_ALLOWED_MESSAGES for msg in normalized)
+    )
+
+
+def _complete_idle_openclaw_heartbeat(
+    self,
+    request,
+    body,
+    gateway_session_key,
+    idempotency_scope,
+    idempotency_key,
+    idempotency_fingerprint,
+    _openai_error,
+) -> web.Response:
+    """Return a normal terminal run without constructing an agent or calling a model."""
+    if idempotency_key:
+        outcome, record = self._run_idempotency_store.lookup(
+            idempotency_scope,
+            idempotency_key,
+            idempotency_fingerprint,
+            retention_until=_room_retention_until(request),
+        )
+        if outcome == "conflict" or (outcome == "reused" and record is not None):
+            return _replay_or_conflict(
+                self, request, outcome, record, gateway_session_key, _openai_error
+            )
+
+    run_id = f"run_{uuid.uuid4().hex}"
+    self._run_owners[run_id] = self._run_idempotency_scope(request)
+    stream = self._run_streams[run_id] = _RunStream()
+    created_at = self._run_streams_created[run_id] = time.time()
+    session_id = body.get("session_id") or run_id
+    usage = dict(_ZERO_RUN_USAGE)
+    status = self._set_run_status(
+        run_id,
+        "completed",
+        created_at=created_at,
+        session_id=session_id,
+        model=body.get("model", self._model_name),
+        output="NO_REPLY",
+        usage=usage,
+        completed=True,
+        partial=False,
+        interrupted=False,
+        skip_reason="idle_openclaw_heartbeat",
+    )
+
+    if idempotency_key:
+        outcome, record = self._run_idempotency_store.reserve(
+            idempotency_scope,
+            idempotency_key,
+            idempotency_fingerprint,
+            run_id,
+            status,
+            owner_pid=self._run_owner_pid,
+            owner_started=self._run_owner_started,
+            retention_until=_room_retention_until(request),
+        )
+        if outcome != "created":
+            _forget_run(
+                self,
+                run_id,
+                self._run_streams,
+                self._run_streams_created,
+                self._run_statuses,
+            )
+            return _replay_or_conflict(
+                self, request, outcome, record, gateway_session_key, _openai_error
+            )
+        self._run_idempotency_ids.add(run_id)
+
+    stream.put_nowait(
+        _run_event(
+            run_id,
+            "run.completed",
+            output="NO_REPLY",
+            usage=usage,
+            completed=True,
+            partial=False,
+            interrupted=False,
+            skip_reason="idle_openclaw_heartbeat",
+        )
+    )
+    stream.put_nowait(None)
+    logger.info("[api_server] short-circuited idle OpenClaw heartbeat as %s", run_id)
+    return _accepted_response(run_id, "completed", gateway_session_key, replayed=False)
+
+
 async def _resolve_live_session_id(self, session_id: str) -> str:
     """Adopt the live compression-continuation tip for a client-addressed session (#98619):
     a /v1/runs run bound to a pre-rotation id would otherwise load a stale history slice and
@@ -730,6 +855,17 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     user_message, input_err = _run_user_message(raw_input, _openai_error)
     if input_err is not None:
         return input_err
+    if _is_idle_openclaw_heartbeat(user_message):
+        return _complete_idle_openclaw_heartbeat(
+            self,
+            request,
+            body,
+            gateway_session_key,
+            idempotency_scope,
+            idempotency_key,
+            idempotency_fingerprint,
+            _openai_error,
+        )
     try:
         turn_author = _api_server._request_turn_author(body)
     except ValueError as exc:
