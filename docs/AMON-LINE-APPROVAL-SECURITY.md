@@ -34,3 +34,17 @@ processes; production deployment; fork main/runtime history reconciliation.
 PR #3 remains the predecessor, and this change is stacked above it.
 
 Authority: YouTrack EDG2-63. Related: EDG2-73.
+
+## Synthetic signed-webhook integration
+
+The in-process LINE webhook handler was exercised using a request body signed
+with LINE's real HMAC-SHA256 convention. Its handler accepted the signed
+postback, dispatched through the LINE allowlist to the exact pending native
+Hermes approval ID, and ignored duplicate event redelivery. Tampered webhook
+signature returned HTTP 401 without touching the approval queue; a signed
+event from a different allowlisted user could not approve an owner's card.
+
+2026-10-19 focused suite: 97/97 PASS, including 22 LINE approval tests and
+three signed-webhook ingress cases. No actual LINE service or phone was used.
+This does not establish production end-to-end reachability, LINE token lifecycle
+under real network conditions, or distributed multi-worker idempotency.
