@@ -376,6 +376,10 @@ _ENV_SEED_KEYS = (("LINE_PORT", "port", int), ("LINE_HOST", "host", None), ("LIN
 
 
 class LineAdapter(BasePlatformAdapter):
+    # Do not downgrade missing/rejected signed approval cards to generic
+    # FIFO-based /approve text. The native queue remains the only authority.
+    requires_bound_exec_approval: bool = True
+
     """LINE Messaging API gateway adapter (no message editing → REQUIRES_EDIT_FINALIZE stays False)."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
@@ -574,6 +578,125 @@ class LineAdapter(BasePlatformAdapter):
             text=text, message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT), source=source_obj,
             raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types))
 
+    def _approval_signature(
+        self, *, chat_id: str, session_key: str, request_id: str, choice: str
+    ) -> str:
+        """Bind card to LINE DM, native approval request and exact choice."""
+        if not self.channel_secret:
+            raise ValueError("LINE channel secret missing")
+        body = ("edgar-line-approval:v1:" + json.dumps(
+            [chat_id, session_key, request_id, choice], ensure_ascii=True,
+            separators=(",", ":"))).encode()
+        return hmac.new(self.channel_secret.encode(), body, hashlib.sha256).hexdigest()[:32]
+
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        """Buttons consume Hermes' *existing* approval queue, not a LINE shadow ledger."""
+        from tools.approval import list_gateway_approvals
+
+        request_id = str((prompt.metadata or {}).get("approval_request_id") or "")
+        if (not self._client or not prompt.chat_id or not self.channel_secret
+                or prompt.chat_id not in self.allowed_users
+                or not request_id or not prompt.session_key):
+            return SendResult(success=False, error="Native LINE approval identity unavailable")
+        if not any(x.get("request_id") == request_id
+                   for x in list_gateway_approvals(prompt.session_key)):
+            return SendResult(success=False, error="Native LINE approval no longer pending")
+
+        # Only per-operation yes/no. No session-wide/permanent escalation from a button.
+        actions = []
+        for label, choice, _style in prompt.actions:
+            if choice not in {"once", "deny"}:
+                continue
+            data = {
+                "action": "exec_approval", "request_id": request_id,
+                "session_key": prompt.session_key, "choice": choice,
+                "sig": self._approval_signature(
+                    chat_id=prompt.chat_id, session_key=prompt.session_key,
+                    request_id=request_id, choice=choice),
+            }
+            encoded = json.dumps(data, separators=(",", ":"), ensure_ascii=True)
+            if len(encoded.encode("utf-8")) > 300:
+                return SendResult(success=False, error="LINE approval data too long")
+            actions.append({
+                "type": "button", "style": "primary" if choice == "once" else "secondary",
+                "action": {
+                    "type": "postback", "label": str(label)[:20],
+                    "data": encoded, "displayText": "核准一次" if choice == "once" else "拒絕",
+                },
+            })
+        if not actions:
+            return SendResult(success=False, error="No safe approval actions")
+        flex = {
+            "type": "flex", "altText": "Hermes 工具操作需要核准",
+            "contents": {
+                "type": "bubble",
+                "body": {
+                    "type": "box", "layout": "vertical",
+                    "contents": [
+                        {"type": "text", "text": "操作核准", "weight": "bold"},
+                        {"type": "text", "text": str(prompt.text)[:900],
+                         "wrap": True, "size": "sm"},
+                    ],
+                },
+                "footer": {"type": "box", "layout": "vertical", "contents": actions},
+            },
+        }
+        return await self._send_messages(prompt.chat_id, [flex])
+
+    async def _handle_exec_approval_postback(
+        self, event: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        """Verify LINE identity+HMAC; atomically consume the exact Hermes queue id."""
+        from tools.approval import list_gateway_approvals, resolve_gateway_approval
+
+        source = event.get("source") or {}
+        chat_id, chat_type = _resolve_chat(source)
+        token = event.get("replyToken", "")
+        if not self._client or not token:
+            return
+        authorized = (chat_type == "dm" and chat_id
+                      and source.get("userId") == chat_id
+                      and chat_id in self.allowed_users)
+        if not authorized:
+            await self._client.reply(token, [_text_message("沒有權限核准此操作")])
+            return
+
+        keys = {"action", "request_id", "session_key", "choice", "sig"}
+        if set(payload) != keys:
+            await self._client.reply(token, [_text_message("無效的核准資料")])
+            return
+        request_id, session_key, choice, signature = (
+            payload.get("request_id"), payload.get("session_key"),
+            payload.get("choice"), payload.get("sig"),
+        )
+        if not (isinstance(request_id, str) and isinstance(session_key, str)
+                and isinstance(signature, str) and isinstance(choice, str)
+                and request_id and session_key and choice in {"once", "deny"}
+                and len(request_id) <= 128 and len(session_key) <= 256):
+            await self._client.reply(token, [_text_message("無效的核准資料")])
+            return
+        if not self.channel_secret or not re.fullmatch(r"[0-9a-f]{32}", signature):
+            await self._client.reply(token, [_text_message("核准身分驗證失敗")])
+            return
+        expected = self._approval_signature(
+            chat_id=chat_id, session_key=session_key,
+            request_id=request_id, choice=choice)
+        if not hmac.compare_digest(signature, expected):
+            await self._client.reply(token, [_text_message("核准身分驗證失敗")])
+            return
+
+        # Fail closed if the prompt timed out or belonged to a different turn.
+        if not any(x.get("request_id") == request_id
+                   for x in list_gateway_approvals(session_key)):
+            await self._client.reply(token, [_text_message("這筆核准已處理或逾時")])
+            return
+        # Native queue resolution is atomic, so duplicate webhook delivery is safe.
+        resolved = resolve_gateway_approval(
+            session_key, choice, request_id=request_id)
+        await self._client.reply(token, [_text_message(
+            ("已核准一次" if choice == "once" else "已拒絕")
+            if resolved == 1 else "這筆核准已處理或逾時")])
+
     async def _handle_amon_capsule_postback(
         self, event: dict[str, Any], payload: dict[str, Any]
     ) -> None:
@@ -626,6 +749,9 @@ class LineAdapter(BasePlatformAdapter):
         except (TypeError, json.JSONDecodeError):
             return
         if not isinstance(parsed, dict):
+            return
+        if parsed.get("action") == "exec_approval":
+            await self._handle_exec_approval_postback(event, parsed)
             return
         if parsed.get("action") == "amon_capsule":
             await self._handle_amon_capsule_postback(event, parsed)

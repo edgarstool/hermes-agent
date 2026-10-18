@@ -656,7 +656,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 fut = self._schedule(
                     adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata, **flags,
+                        description=desc,
+                        metadata={
+                            **(ctx._status_thread_metadata or {}),
+                            "approval_request_id": approval_data.get("request_id"),
+                        },
+                        **flags,
                     ),
                     "send_exec_approval scheduling error",
                 )
@@ -706,12 +711,21 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         "exec approval undeliverable: connector egress declined "
                         "this destination"
                     )
+                if getattr(adapter, "requires_bound_exec_approval", False):
+                    raise _ExecApprovalDeclined(
+                        "LINE approval card unavailable; exact request_id required; "
+                        "unsafe plaintext approval fallback disabled"
+                    )
                 logger.warning("Button-based approval failed (send returned error), falling back to text")
             except _ExecApprovalDeclined:
                 # Must escape this handler: the fallback below is a text send to
                 # the destination the connector just refused.
                 raise
             except Exception as e:
+                if getattr(adapter, "requires_bound_exec_approval", False):
+                    raise _ExecApprovalDeclined(
+                        "LINE approval card failed; refusing request_id-less text fallback"
+                    ) from e
                 logger.warning("Button-based approval failed, falling back to text: %s", e)
         # Plain-text prompt with the adapter's typed prefix (e.g. `!approve`): typed "/" is blocked
         # in Slack threads and reserved by Matrix clients.
