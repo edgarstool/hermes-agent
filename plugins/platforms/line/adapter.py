@@ -574,6 +574,48 @@ class LineAdapter(BasePlatformAdapter):
             text=text, message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT), source=source_obj,
             raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types))
 
+    async def _handle_amon_capsule_postback(
+        self, event: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        """Safe product-to-agent bridge: no direct shell or second approval store."""
+        source = event.get("source") or {}
+        chat_id, chat_type = _resolve_chat(source)
+        token = event.get("replyToken", "")
+        if not self._client or not token:
+            return
+        # Postbacks are normally checked by _dispatch_event. Repeat the
+        # check here so direct calls remain fail-closed too.
+        authorized = _allowed_for_source(
+            source, allow_all=self.allow_all, user_ids=self.allowed_users,
+            group_ids=self.allowed_groups, room_ids=self.allowed_rooms,
+        )
+        user_id = source.get("userId", "")
+        if chat_type != "dm" or not authorized or user_id not in self.allowed_users:
+            await self._client.reply(token, [_text_message("沒有權限執行此操作")])
+            return
+        try:
+            import importlib.util
+            path = Path(__file__).resolve().parents[2] / "amon-pocket" / "__init__.py"
+            spec = importlib.util.spec_from_file_location("edgar_amon_pocket_line", path)
+            if spec is None or spec.loader is None:
+                raise ValueError("capsule plugin missing")
+            plugin = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(plugin)
+            prompt = plugin.compile_line_postback_request(payload)
+        except (ValueError, KeyError, TypeError, FileNotFoundError, AttributeError) as exc:
+            logger.warning("LINE Amon postback refused: %s", type(exc).__name__)
+            await self._client.reply(token, [_text_message("指令無效，未執行任何操作")])
+            return
+        self._reply_tokens[chat_id] = (token, time.time() + LINE_REPLY_TOKEN_TTL_SECONDS)
+        source_obj = self.build_source(
+            chat_id=chat_id, chat_type=chat_type, user_id=user_id,
+            user_name=user_id, chat_name=chat_id,
+        )
+        await self.handle_message(MessageEvent(
+            text=prompt, message_type=MessageType.TEXT, source=source_obj,
+            raw_message=event,
+        ))
+
     async def _handle_postback_event(self, event: dict[str, Any]) -> None:
         """User tapped the slow-LLM postback button — deliver the cached payload. READY replies (push
         fallback) and ERROR replies settle the entry; DELIVERED / PENDING just re-issue their notice."""
@@ -582,6 +624,11 @@ class LineAdapter(BasePlatformAdapter):
         try:
             parsed = json.loads((event.get("postback") or {}).get("data", "") or "")
         except (TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(parsed, dict):
+            return
+        if parsed.get("action") == "amon_capsule":
+            await self._handle_amon_capsule_postback(event, parsed)
             return
         request_id = parsed.get("request_id", "") if parsed.get("action") == "show_response" else ""
         entry = self._cache.get(request_id) if request_id else None
