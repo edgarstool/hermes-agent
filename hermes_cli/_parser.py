@@ -151,6 +151,11 @@ def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
         "previews, no session_id line. Tools, memory, rules, and "
         "AGENTS.md in the CWD are loaded as normal; approvals are "
         "auto-bypassed. Intended for scripts / pipes."))
+    add("--turn-timeout", type=float, default=None, metavar="SECONDS", help=(
+        "Opt-in deadline for fresh -z/--oneshot turns, 0 < SECONDS <= 600. "
+        "At expiry request an interrupt for exactly that session. "
+        "Without this flag, disconnecting leaves accepted work running."))
+
     add("--usage-file", metavar="PATH", default=None, help=(
         "One-shot mode only: after the run, write a JSON usage report "
         "(estimated cost, token counts, model, api_calls) to PATH. "

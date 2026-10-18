@@ -80,6 +80,16 @@ def validate_options(args):
         where = "".join(f"\n  {spell[name]}: use {_RELOCATED[name]}" for name in unsupported)
         raise GatewayClientError(
             f"Unsupported gateway CLI options: {flags}. No local fallback or policy changes were made.{where}")
+    # Never interrupt an already-existing human/automation session due to a CLI deadline.
+    # Only newly-created -z sessions may opt in; default detach semantics stay untouched.
+    deadline = getattr(args, "turn_timeout", None)
+    if deadline is not None:
+        if not isinstance(deadline, (int, float)) or not 0 < deadline <= 600:
+            raise GatewayClientError("--turn-timeout must be 0 < SECONDS <= 600")
+        if not isinstance(getattr(args, "oneshot", None), str):
+            raise GatewayClientError("--turn-timeout requires fresh -z/--oneshot")
+        if getattr(args, "resume", None) or getattr(args, "continue_last", None):
+            raise GatewayClientError("--turn-timeout cannot interrupt an existing resumed session")
     # Creation flags repeated on resume are checked against the frozen route once the snapshot is
     # back (`check_resume_policy`): the same flags again are fine, a different value is refused.
     # A resume reuses the frozen route and reads no default (the TUI launcher's rule too).
@@ -139,6 +149,39 @@ async def _resume_latest(client, args):
             raise
         raise GatewayClientError("No previous CLI session to continue. Start a new one with `hermes`, "
                                  "or list sessions with `hermes sessions list`.") from None
+
+
+async def _bounded_oneshot(view, client, prompt, *, deadline: float) -> int:
+    """Opt-in timeout for one newly created -z session; never a global kill.
+
+    Interrupt RPC acceptance is NOT proof that the Gateway stopped. The caller
+    must inspect its durable receipt for that, so output is deliberately modest.
+    """
+    try:
+        return await asyncio.wait_for(view.run(prompt, oneshot=True), timeout=deadline)
+    except TimeoutError:
+        session_id = view.session_id
+        try:
+            # Obtain the running generation immediately before interrupt to
+            # avoid steering another session/turn through a stale generation.
+            snapshot = await asyncio.wait_for(
+                client.rpc("session.resume", session_id=session_id), 5
+            )
+            gen = snapshot.get("execution_generation")
+            if type(gen) is not int or gen < 0:
+                raise GatewayClientError("no current execution generation")
+            await asyncio.wait_for(
+                client.rpc("session.interrupt", session_id=session_id,
+                           execution_generation=gen),
+                5,
+            )
+            print(f"Deadline expired; interrupt requested for session {session_id}. "
+                  "Owner-side termination not yet verified.", file=sys.stderr)
+        except (Exception, asyncio.CancelledError) as exc:
+            print(f"Deadline expired; interrupt UNVERIFIED for session {session_id} "
+                  f"({type(exc).__name__}). Inspect this session before retrying.",
+                  file=sys.stderr)
+        return 124
 
 
 async def run_gateway_chat(args, emitter=None):
@@ -217,6 +260,9 @@ async def run_gateway_chat(args, emitter=None):
             for row in snapshot.get("messages", []):
                 if row.get("role") in {"user", "assistant"} and isinstance(row.get("content"), str):
                     print(f"{row['role']}: {row['content']}")
+        deadline = getattr(args, "turn_timeout", None)
+        if deadline is not None:
+            return await _bounded_oneshot(view, client, query, deadline=deadline)
         return await view.run(query, oneshot=oneshot)
 
 
