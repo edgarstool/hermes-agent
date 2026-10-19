@@ -25,7 +25,8 @@ jobs:
         uses: ./.github/actions/setup-pm
         with:
           test-environment: 'true'
-          extras: '[]'
+          # LINE webhook lives in the repository's pinned messaging extra.
+          extras: '["messaging"]'
           cache: 'false'
       - name: Run LINE/Capsule/native approval regression
         shell: bash

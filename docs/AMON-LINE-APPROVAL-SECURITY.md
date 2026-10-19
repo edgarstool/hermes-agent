@@ -65,3 +65,9 @@ pushes on feat/edg2-63-line-approval-bound-20261019. Public repo standard
 GitHub-hosted ubuntu-24.04 runner, no paid Blacksmith dependency, no secret
 access, no cache storage, and no production deployment. Its result must be
 read back separately; pending workflows are not a PASS.
+
+GitHub-hosted first execution (run 39201248801) established the free runner
+actually starts, then reported 93 PASS / 5 FAIL because the initial workflow
+omitted the repository's optional messaging extra containing aiohttp. The
+branch-scoped workflow now selects the repository's already pinned
+["messaging"] extra; no runtime code or LINE secret was changed.
