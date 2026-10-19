@@ -350,3 +350,62 @@ def test_line_signed_webhook_from_other_allowed_user_is_not_owner(ready):
         _signed_line_webhook(adapter, clicked, who="Uother")))
     assert response.status == 200
     assert entry.result is None
+
+
+def test_real_loopback_http_ingress_routes_signed_line_approval_and_rejects_mutation(ready):
+    """Actual TCP HTTP, not direct handler invocation; no LINE/external network."""
+    import base64
+    import hashlib
+    import hmac
+    from aiohttp import ClientSession, web
+
+    adapter, entry = ready
+
+    async def exercise():
+        actions = await card(adapter)
+        clicked = next(x for x in actions if x["choice"] == "once")
+        app = web.Application()
+        app.router.add_post("/line/webhook", adapter._handle_webhook)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        sock = site._server.sockets[0]
+        port = sock.getsockname()[1]
+        url = f"http://127.0.0.1:{port}/line/webhook"
+        payload = {
+            "events": [{
+                **event(clicked), "webhookEventId": "edg-native-http-owner-001",
+            }],
+        }
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        signature = base64.b64encode(hmac.new(
+            adapter.channel_secret.encode(), raw, hashlib.sha256,
+        ).digest()).decode()
+        try:
+            async with ClientSession() as session:
+                # The same signature must fail if a proxy/attacker mutates raw bytes.
+                mutated = raw.replace(b"edg-native-http-owner-001", b"edg-native-http-owner-002")
+                assert mutated != raw
+                async with session.post(url, data=mutated,
+                                        headers={"X-Line-Signature": signature}) as resp:
+                    assert resp.status == 401
+                assert entry.result is None
+
+                async with session.post(url, data=raw,
+                                        headers={"X-Line-Signature": signature}) as resp:
+                    assert resp.status == 200
+                assert entry.result == "once"
+
+                # A separately signed redelivery cannot approve another request.
+                replacement = _ApprovalEntry({"request_id": "another-request", "command": "different"})
+                approval._gateway_queues[SESSION] = [replacement]
+                async with session.post(url, data=raw,
+                                        headers={"X-Line-Signature": signature}) as resp:
+                    assert resp.status == 200
+                assert replacement.result is None
+                assert adapter._client.reply.await_count == 1
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(exercise())

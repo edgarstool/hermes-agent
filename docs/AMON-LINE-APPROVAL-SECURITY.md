@@ -48,3 +48,20 @@ event from a different allowlisted user could not approve an owner's card.
 three signed-webhook ingress cases. No actual LINE service or phone was used.
 This does not establish production end-to-end reachability, LINE token lifecycle
 under real network conditions, or distributed multi-worker idempotency.
+
+## Real local TCP HTTP and branch-scoped GitHub CI fallback
+
+The same signed LINE webhook is also sent via a real TCP loopback socket
+(127.0.0.1 on an OS-assigned ephemeral port) to an aiohttp route. A signature
+computed over the original body approves exactly one queued request; mutated
+raw bytes with the unchanged signature return HTTP 401. Signed redelivery does
+not authorize a subsequent approval. The listener is test-owned and closes
+after each test. This does NOT involve the production LINE channel.
+
+The upstream/fork workflows select Blacksmith runner labels, which currently
+have zero scheduled jobs for PR #4. A narrow GitHub-hosted fallback workflow
+under .github/workflows/edgar-line-approval-proof.yml is restricted to
+pushes on feat/edg2-63-line-approval-bound-20261019. Public repo standard
+GitHub-hosted ubuntu-24.04 runner, no paid Blacksmith dependency, no secret
+access, no cache storage, and no production deployment. Its result must be
+read back separately; pending workflows are not a PASS.
