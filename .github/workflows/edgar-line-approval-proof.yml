@@ -35,4 +35,4 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${HERMES_PYTHON:-}"
-          "$HERMES_PYTHON" -m pytest -q             tests/gateway/test_line_native_approval_binding.py             tests/gateway/test_line_plugin.py             tests/gateway/test_line_amon_postback.py             tests/plugins/test_amon_pocket.py             tests/plugins/test_amon_pocket_line_cards.py             tests/gateway/test_approval_prompt_redaction.py             tests/gateway/test_approve_deny_commands.py
+          "$HERMES_PYTHON" -m pytest -q             tests/gateway/test_line_native_approval_binding.py             tests/gateway/test_line_staging_gate.py             tests/gateway/test_line_plugin.py             tests/gateway/test_line_amon_postback.py             tests/plugins/test_amon_pocket.py             tests/plugins/test_amon_pocket_line_cards.py             tests/gateway/test_approval_prompt_redaction.py             tests/gateway/test_approve_deny_commands.py
