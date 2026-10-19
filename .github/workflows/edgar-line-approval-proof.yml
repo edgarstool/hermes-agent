@@ -1,0 +1,38 @@
+# EDG2-63 temporary branch-scoped evidence. Public fork: GitHub standard runner
+# costs no minutes; never uses unavailable Blacksmith runners or paid models.
+name: EDGAR LINE Native Approval Proof
+on:
+  push:
+    branches:
+      - feat/edg2-63-line-approval-bound-20261019
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edgar-line-approval-proof-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  line-approval-proof:
+    name: Signed webhook + native approval security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout review branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install repository locked Python without paid runner
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          # LINE webhook lives in the repository's pinned messaging extra.
+          extras: '["messaging"]'
+          cache: 'false'
+      - name: Run LINE/Capsule/native approval regression
+        shell: bash
+        env:
+          HERMES_TELEMETRY: 'false'
+        run: |
+          set -euo pipefail
+          test -n "${HERMES_PYTHON:-}"
+          "$HERMES_PYTHON" -m pytest -q             tests/gateway/test_line_native_approval_binding.py             tests/gateway/test_line_staging_gate.py             tests/gateway/test_line_webhook_ack.py             tests/gateway/test_line_product_view_delivery.py             tests/gateway/test_line_plugin.py             tests/gateway/test_line_amon_postback.py             tests/plugins/test_amon_pocket.py             tests/plugins/test_amon_pocket_line_cards.py             tests/gateway/test_approval_prompt_redaction.py             tests/gateway/test_approve_deny_commands.py

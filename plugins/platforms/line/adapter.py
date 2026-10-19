@@ -376,6 +376,10 @@ _ENV_SEED_KEYS = (("LINE_PORT", "port", int), ("LINE_HOST", "host", None), ("LIN
 
 
 class LineAdapter(BasePlatformAdapter):
+    # Do not downgrade missing/rejected signed approval cards to generic
+    # FIFO-based /approve text. The native queue remains the only authority.
+    requires_bound_exec_approval: bool = True
+
     """LINE Messaging API gateway adapter (no message editing → REQUIRES_EDIT_FINALIZE stays False)."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
@@ -424,6 +428,11 @@ class LineAdapter(BasePlatformAdapter):
         self._media_temp_paths: set[str] = set()
         self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
         self._pending_buttons: dict[str, str] = {}  # one outstanding button per chat: chat_id → request_id
+        # Accepted callbacks remain owned by this adapter until completed or
+        # cancelled at disconnect. No new outbox, session store or daemon.
+        self._webhook_tasks: set[asyncio.Task] = set()
+        self._webhook_task_limit = 64  # fail with retryable 503 instead of unbounded memory growth
+        self._webhook_closing = False
 
     def _fail(self, code: str, detail: str, *, retryable: bool = False) -> bool:  # fatal connect error → False
         self._set_fatal_error(code, detail, retryable=retryable)
@@ -436,6 +445,7 @@ class LineAdapter(BasePlatformAdapter):
         tok_hash = hashlib.sha256(self.channel_access_token.encode()).hexdigest()[:16]
         if not self._acquire_platform_lock("line", tok_hash, "LINE channel"):
             return False
+        self._webhook_closing = False
         self._client = _LineClient(self.channel_access_token)
         try:  # best-effort self-userId for self-echo filtering (LINE rarely echoes anyway)
             self._bot_user_id = await self._client.get_bot_user_id()
@@ -477,6 +487,13 @@ class LineAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        self._webhook_closing = True
+        pending = list(self._webhook_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._webhook_tasks.clear()
         self._mark_disconnected()
         for attr, method in (("_site", "stop"), ("_runner", "cleanup")):
             obj = getattr(self, attr)
@@ -511,12 +528,32 @@ class LineAdapter(BasePlatformAdapter):
             payload = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return web.Response(status=400, text="bad json")
-        for event in payload.get("events", []) or []:
+        if not isinstance(payload, dict):
+            return web.Response(status=400, text="bad payload")
+        events = payload.get("events", [])
+        if not isinstance(events, list) or any(not isinstance(x, dict) for x in events):
+            return web.Response(status=400, text="bad events")
+        if self._webhook_closing:
+            # Do not accept work with a success ACK during shutdown.
+            return web.Response(status=503, text="stopping")
+        if events and len(self._webhook_tasks) >= self._webhook_task_limit:
+            # No durable inbox exists here. 503 signals overload rather than
+            # falsely acknowledging work which has not been scheduled.
+            return web.Response(status=503, text="busy")
+        if events:
+            # LINE expects a prompt ACK. The single task preserves intra-payload
+            # ordering and keeps the native approval queue in this owner process.
+            task = asyncio.create_task(self._dispatch_webhook_events(events))
+            self._webhook_tasks.add(task)
+            task.add_done_callback(self._webhook_tasks.discard)
+        return web.Response(status=200, text="ok")
+
+    async def _dispatch_webhook_events(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
             try:
                 await self._dispatch_event(event)
             except Exception:
                 logger.exception("LINE: dispatch_event failed")
-        return web.Response(status=200, text="ok")
 
     async def _dispatch_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -574,6 +611,125 @@ class LineAdapter(BasePlatformAdapter):
             text=text, message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT), source=source_obj,
             raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types))
 
+    def _approval_signature(
+        self, *, chat_id: str, session_key: str, request_id: str, choice: str
+    ) -> str:
+        """Bind card to LINE DM, native approval request and exact choice."""
+        if not self.channel_secret:
+            raise ValueError("LINE channel secret missing")
+        body = ("edgar-line-approval:v1:" + json.dumps(
+            [chat_id, session_key, request_id, choice], ensure_ascii=True,
+            separators=(",", ":"))).encode()
+        return hmac.new(self.channel_secret.encode(), body, hashlib.sha256).hexdigest()[:32]
+
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        """Buttons consume Hermes' *existing* approval queue, not a LINE shadow ledger."""
+        from tools.approval import list_gateway_approvals
+
+        request_id = str((prompt.metadata or {}).get("approval_request_id") or "")
+        if (not self._client or not prompt.chat_id or not self.channel_secret
+                or prompt.chat_id not in self.allowed_users
+                or not request_id or not prompt.session_key):
+            return SendResult(success=False, error="Native LINE approval identity unavailable")
+        if not any(x.get("request_id") == request_id
+                   for x in list_gateway_approvals(prompt.session_key)):
+            return SendResult(success=False, error="Native LINE approval no longer pending")
+
+        # Only per-operation yes/no. No session-wide/permanent escalation from a button.
+        actions = []
+        for label, choice, _style in prompt.actions:
+            if choice not in {"once", "deny"}:
+                continue
+            data = {
+                "action": "exec_approval", "request_id": request_id,
+                "session_key": prompt.session_key, "choice": choice,
+                "sig": self._approval_signature(
+                    chat_id=prompt.chat_id, session_key=prompt.session_key,
+                    request_id=request_id, choice=choice),
+            }
+            encoded = json.dumps(data, separators=(",", ":"), ensure_ascii=True)
+            if len(encoded.encode("utf-8")) > 300:
+                return SendResult(success=False, error="LINE approval data too long")
+            actions.append({
+                "type": "button", "style": "primary" if choice == "once" else "secondary",
+                "action": {
+                    "type": "postback", "label": str(label)[:20],
+                    "data": encoded, "displayText": "核准一次" if choice == "once" else "拒絕",
+                },
+            })
+        if not actions:
+            return SendResult(success=False, error="No safe approval actions")
+        flex = {
+            "type": "flex", "altText": "Hermes 工具操作需要核准",
+            "contents": {
+                "type": "bubble",
+                "body": {
+                    "type": "box", "layout": "vertical",
+                    "contents": [
+                        {"type": "text", "text": "操作核准", "weight": "bold"},
+                        {"type": "text", "text": str(prompt.text)[:900],
+                         "wrap": True, "size": "sm"},
+                    ],
+                },
+                "footer": {"type": "box", "layout": "vertical", "contents": actions},
+            },
+        }
+        return await self._send_messages(prompt.chat_id, [flex])
+
+    async def _handle_exec_approval_postback(
+        self, event: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        """Verify LINE identity+HMAC; atomically consume the exact Hermes queue id."""
+        from tools.approval import list_gateway_approvals, resolve_gateway_approval
+
+        source = event.get("source") or {}
+        chat_id, chat_type = _resolve_chat(source)
+        token = event.get("replyToken", "")
+        if not self._client or not token:
+            return
+        authorized = (chat_type == "dm" and chat_id
+                      and source.get("userId") == chat_id
+                      and chat_id in self.allowed_users)
+        if not authorized:
+            await self._client.reply(token, [_text_message("沒有權限核准此操作")])
+            return
+
+        keys = {"action", "request_id", "session_key", "choice", "sig"}
+        if set(payload) != keys:
+            await self._client.reply(token, [_text_message("無效的核准資料")])
+            return
+        request_id, session_key, choice, signature = (
+            payload.get("request_id"), payload.get("session_key"),
+            payload.get("choice"), payload.get("sig"),
+        )
+        if not (isinstance(request_id, str) and isinstance(session_key, str)
+                and isinstance(signature, str) and isinstance(choice, str)
+                and request_id and session_key and choice in {"once", "deny"}
+                and len(request_id) <= 128 and len(session_key) <= 256):
+            await self._client.reply(token, [_text_message("無效的核准資料")])
+            return
+        if not self.channel_secret or not re.fullmatch(r"[0-9a-f]{32}", signature):
+            await self._client.reply(token, [_text_message("核准身分驗證失敗")])
+            return
+        expected = self._approval_signature(
+            chat_id=chat_id, session_key=session_key,
+            request_id=request_id, choice=choice)
+        if not hmac.compare_digest(signature, expected):
+            await self._client.reply(token, [_text_message("核准身分驗證失敗")])
+            return
+
+        # Fail closed if the prompt timed out or belonged to a different turn.
+        if not any(x.get("request_id") == request_id
+                   for x in list_gateway_approvals(session_key)):
+            await self._client.reply(token, [_text_message("這筆核准已處理或逾時")])
+            return
+        # Native queue resolution is atomic, so duplicate webhook delivery is safe.
+        resolved = resolve_gateway_approval(
+            session_key, choice, request_id=request_id)
+        await self._client.reply(token, [_text_message(
+            ("已核准一次" if choice == "once" else "已拒絕")
+            if resolved == 1 else "這筆核准已處理或逾時")])
+
     async def _handle_amon_capsule_postback(
         self, event: dict[str, Any], payload: dict[str, Any]
     ) -> None:
@@ -627,11 +783,19 @@ class LineAdapter(BasePlatformAdapter):
             return
         if not isinstance(parsed, dict):
             return
+        if parsed.get("action") == "exec_approval":
+            await self._handle_exec_approval_postback(event, parsed)
+            return
         if parsed.get("action") == "amon_capsule":
             await self._handle_amon_capsule_postback(event, parsed)
             return
         request_id = parsed.get("request_id", "") if parsed.get("action") == "show_response" else ""
         entry = self._cache.get(request_id) if request_id else None
+        # A cached Product View can carry private diagnostic evidence. The
+        # opaque request id is not proof of chat ownership; use the existing
+        # pending-button owner mapping before revealing any cached payload.
+        if entry is not None and self._pending_buttons.get(chat_id) != request_id:
+            entry = None
         if not self._client or not reply_token:
             return
         if entry is None:
@@ -649,7 +813,13 @@ class LineAdapter(BasePlatformAdapter):
             return
         state = entry.state
         if state is State.READY:
-            messages = _text_messages(str(entry.payload or ""))
+            payload = entry.payload
+            if (isinstance(payload, dict) and payload.get("kind") == "line_message"
+                    and isinstance(payload.get("message"), dict)
+                    and payload["message"].get("type") == "flex"):
+                messages = [payload["message"]]
+            else:
+                messages = _text_messages(str(payload or ""))
         elif state is State.ERROR:
             messages = [_text_message(str(entry.payload or self.interrupted_text))]
         else:
@@ -693,11 +863,53 @@ class LineAdapter(BasePlatformAdapter):
             logger.warning("LINE: failed to cache %s payload: %s", msg_type, exc)
             return None, ""
 
+    @staticmethod
+    def _product_view_message(metadata: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        """Validate Amon's exact LINE Flex envelope; otherwise use safe text."""
+        if not isinstance(metadata, dict):
+            return None
+        view = metadata.get("product_view")
+        if (not isinstance(view, dict)
+                or view.get("version") != "edgar.product-view.v0"
+                or view.get("capsule_id") != "server-doctor"):
+            return None
+        message = view.get("line")
+        if not isinstance(message, dict) or message.get("type") != "flex":
+            return None
+        alt = message.get("altText")
+        contents = message.get("contents")
+        if (not isinstance(alt, str) or not alt.strip()
+                or len(alt) > 1500
+                or not isinstance(contents, dict)
+                or contents.get("type") not in {"bubble", "carousel"}):
+            return None
+        # Keep unknown/future payloads from reaching the wire via metadata.
+        # The actual trusted producer is Amon's compile_server_doctor_product_view.
+        try:
+            if len(json.dumps(message, ensure_ascii=False).encode("utf-8")) > 40_000:
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return message
+
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
+        # Amon Product View rides Hermes' existing reply token / push routing.
+        # Interim system notices never turn into interactive cards.
+        flex = None if _is_interim_send(content, metadata) else self._product_view_message(metadata)
+        if flex is not None:
+            pending_rid = self._pending_buttons.get(chat_id)
+            if pending_rid:
+                entry = self._cache.get(pending_rid)
+                if entry is not None and entry.state is State.PENDING:
+                    self._cache.set_ready(pending_rid, {"kind": "line_message", "message": flex})
+                    return SendResult(success=True, message_id=pending_rid)
+                # A stale or fulfilled button cannot swallow this card.
+                self._pending_buttons.pop(chat_id, None)
+            return await self._send_messages(chat_id, [flex])
         # A PENDING postback button caches the response for the tap — except interim /
         # system sends (progress heartbeats, busy-acks), which must land as visible
         # bubbles. Interim detection is purpose-first: the gateway marks every mid-turn
