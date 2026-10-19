@@ -432,13 +432,31 @@ def build_server_doctor_result_card(
     success: bool,
     summary: str,
     verification: str,
+    result_state: str | None = None,
 ) -> dict[str, Any]:
-    """Build a terminal result surface; result cards never contain mutating actions."""
+    """Render bounded evidence status, not transport success as action success."""
     service = _normalize_service_name(service)
     action = str(action or "").strip().lower()
     if action not in _SERVER_DOCTOR_ACTIONS:
         raise ValueError(f"unknown action: {action or '<empty>'}")
-    status_text = "\u2705 \u6210\u529f" if success else "\u26a0\ufe0f \u672a\u6210\u529f"
+    # These labels describe the *tool execution*, not whether LINE accepted
+    # a Reply/Push. Missing terminal evidence must never render a green card.
+    labels = {
+        "awaiting_approval": "🕒 等待核准",
+        "awaiting_execution": "🟡 已核准，尚未執行",
+        "running": "⏳ 執行中",
+        "denied": "⛔ 已拒絕",
+        "blocked": "⛔ 已阻擋",
+        "executed_unverified": "🔎 已執行，尚未驗證",
+        "unknown": "❔ 尚無執行證據",
+        "failed": "⚠️ 執行失敗",
+        "verified_success": "✅ 成功",
+    }
+    if result_state is not None and result_state not in labels:
+        raise ValueError("unsupported execution result state")
+    status_text = labels[result_state] if result_state else (
+        "✅ 成功" if success else "⚠️ 未成功"
+    )
     action_label = {"status": "\u72c0\u614b\u6aa2\u67e5", "diagnose": "\u8a3a\u65b7", "repair": "\u4fee\u5fa9"}[action]
     verification_text = _clip_text(verification or "\u672a\u77e5", 700)
     return _line_bubble(
@@ -460,15 +478,46 @@ def build_server_doctor_result_card(
 
 
 
-def _execution_success(execution: dict[str, Any]) -> bool:
-    error = execution.get("error")
+def _execution_result_state(action: str, execution: dict[str, Any]) -> str:
+    """Classify canonical tool evidence. No exit code means no completed execution.
+
+    This state is deliberately independent from LINE's transport ACK.
+    A repair can be called verified only when the guarded terminal command
+    returned exit_code=0 *and* its final systemctl is-active proof is active.
+    """
     status = str(execution.get("status") or "").strip().lower()
+    if status in {"pending", "pending_approval", "awaiting_approval", "approval_required"}:
+        return "awaiting_approval"
+    if status in {"approved", "approval_granted", "awaiting_execution"}:
+        return "awaiting_execution"
+    if status in {"running", "in_progress", "queued", "executing"}:
+        return "running"
+    if status in {"denied", "rejected", "approval_denied"}:
+        return "denied"
+    if status in {"blocked", "disabled", "policy_blocked"}:
+        return "blocked"
+    if execution.get("error") or status in {"error", "failed", "failure", "cancelled", "timeout"}:
+        return "failed"
+
+    # Reject booleans, string "0", absent exit codes and model-generated
+    # "success" flags. Only the canonical terminal numeric code is evidence.
     exit_code = execution.get("exit_code")
-    if error:
-        return False
-    if status in {"error", "blocked", "pending_approval", "disabled"}:
-        return False
-    return exit_code in {None, 0}
+    if type(exit_code) is not int:
+        return "unknown"
+    if exit_code != 0:
+        return "failed"
+
+    output = str(execution.get("output") or "")
+    lines = [line.strip().lower() for line in output.splitlines() if line.strip()]
+    if action in {"repair", "status"}:
+        return "verified_success" if lines and lines[-1] == "active" else "executed_unverified"
+    # For diagnosis, success is about collecting evidence, not a repaired host.
+    return "verified_success" if lines else "executed_unverified"
+
+
+def _execution_success(execution: dict[str, Any]) -> bool:
+    """Legacy helper uses conservative positive proof, not missing exit code."""
+    return _execution_result_state("repair", execution) == "verified_success"
 
 
 def _execution_evidence(execution: dict[str, Any]) -> list[str]:
@@ -497,7 +546,8 @@ def compile_server_doctor_product_view(
     if not isinstance(execution, dict):
         execution = {"raw": str(execution)}
 
-    success = _execution_success(execution)
+    result_state = _execution_result_state(action, execution)
+    success = result_state == "verified_success"
     evidence = _execution_evidence(execution)
     status = str(execution.get("status") or "").strip()
     error = str(execution.get("error") or "").strip()
@@ -520,7 +570,7 @@ def compile_server_doctor_product_view(
             ),
             evidence=evidence,
             recommendation="\u8acb\u5148\u67e5\u770b\u8b49\u64da\uff1b\u82e5\u4f60\u6c7a\u5b9a\u4fee\u5fa9\uff0c\u4ecd\u6703\u8981\u6c42\u6838\u51c6\u3002",
-            repair_recommended=True,
+            repair_recommended=success,
             scope=scope,
         )
     else:
@@ -530,6 +580,7 @@ def compile_server_doctor_product_view(
             success=success,
             summary=summary,
             verification=(evidence[-1] if evidence else status or "unknown"),
+            result_state=result_state,
         )
 
     structured_content = {
@@ -538,6 +589,10 @@ def compile_server_doctor_product_view(
         "service": service,
         "scope": scope,
         "success": success,
+        "result_state": result_state,
+        # The tool-produced Product View exists *before* any LINE transport.
+        # Do not conflate a later send() acceptance with task completion.
+        "delivery_state": "not_sent",
         "status": status or None,
         "exit_code": execution.get("exit_code"),
         "summary": summary,
