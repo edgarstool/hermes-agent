@@ -313,11 +313,18 @@ def _signed_line_webhook(adapter, approval_action, *, who="Uowner", valid=True):
     return request
 
 
+async def _handle_and_settle_webhook(adapter, request):
+    response = await adapter._handle_webhook(request)
+    if adapter._webhook_tasks:
+        await asyncio.gather(*list(adapter._webhook_tasks))
+    return response
+
+
 def test_line_signed_webhook_to_exact_native_approval_and_replay(ready):
     adapter, entry = ready
     actions = asyncio.run(card(adapter))
     clicked = next(x for x in actions if x["choice"] == "once")
-    first = asyncio.run(adapter._handle_webhook(_signed_line_webhook(adapter, clicked)))
+    first = asyncio.run(_handle_and_settle_webhook(adapter, _signed_line_webhook(adapter, clicked)))
     assert first.status == 200
     assert entry.result == "once"
     assert SESSION not in approval._gateway_queues
@@ -325,7 +332,7 @@ def test_line_signed_webhook_to_exact_native_approval_and_replay(ready):
     # Same signed webhook re-delivery must not consume or re-authorize a new turn.
     replacement = _ApprovalEntry({"request_id": "next-request", "command": "different"})
     approval._gateway_queues[SESSION] = [replacement]
-    second = asyncio.run(adapter._handle_webhook(_signed_line_webhook(adapter, clicked)))
+    second = asyncio.run(_handle_and_settle_webhook(adapter, _signed_line_webhook(adapter, clicked)))
     assert second.status == 200
     assert replacement.result is None
     assert adapter._client.reply.await_count == 1
@@ -335,7 +342,7 @@ def test_line_invalid_webhook_signature_never_touches_approval_queue(ready):
     adapter, entry = ready
     actions = asyncio.run(card(adapter))
     denied = next(x for x in actions if x["choice"] == "deny")
-    response = asyncio.run(adapter._handle_webhook(
+    response = asyncio.run(_handle_and_settle_webhook(adapter,
         _signed_line_webhook(adapter, denied, valid=False)))
     assert response.status == 401
     assert entry.result is None
@@ -346,7 +353,7 @@ def test_line_signed_webhook_from_other_allowed_user_is_not_owner(ready):
     adapter, entry = ready
     actions = asyncio.run(card(adapter))
     clicked = next(x for x in actions if x["choice"] == "once")
-    response = asyncio.run(adapter._handle_webhook(
+    response = asyncio.run(_handle_and_settle_webhook(adapter,
         _signed_line_webhook(adapter, clicked, who="Uother")))
     assert response.status == 200
     assert entry.result is None
@@ -395,6 +402,7 @@ def test_real_loopback_http_ingress_routes_signed_line_approval_and_rejects_muta
                 async with session.post(url, data=raw,
                                         headers={"X-Line-Signature": signature}) as resp:
                     assert resp.status == 200
+                await asyncio.gather(*list(adapter._webhook_tasks))
                 assert entry.result == "once"
 
                 # A separately signed redelivery cannot approve another request.
@@ -403,6 +411,7 @@ def test_real_loopback_http_ingress_routes_signed_line_approval_and_rejects_muta
                 async with session.post(url, data=raw,
                                         headers={"X-Line-Signature": signature}) as resp:
                     assert resp.status == 200
+                await asyncio.gather(*list(adapter._webhook_tasks))
                 assert replacement.result is None
                 assert adapter._client.reply.await_count == 1
         finally:
@@ -458,6 +467,7 @@ def test_concurrent_signed_postbacks_exactly_one_native_approval(ready):
                         return response.status
                 statuses = await asyncio.gather(send(1), send(2))
                 assert statuses == [200, 200]
+                await asyncio.gather(*list(adapter._webhook_tasks))
         finally:
             await runner.cleanup()
 

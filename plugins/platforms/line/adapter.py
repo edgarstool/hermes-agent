@@ -428,6 +428,11 @@ class LineAdapter(BasePlatformAdapter):
         self._media_temp_paths: set[str] = set()
         self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
         self._pending_buttons: dict[str, str] = {}  # one outstanding button per chat: chat_id → request_id
+        # Accepted callbacks remain owned by this adapter until completed or
+        # cancelled at disconnect. No new outbox, session store or daemon.
+        self._webhook_tasks: set[asyncio.Task] = set()
+        self._webhook_task_limit = 64  # fail with retryable 503 instead of unbounded memory growth
+        self._webhook_closing = False
 
     def _fail(self, code: str, detail: str, *, retryable: bool = False) -> bool:  # fatal connect error → False
         self._set_fatal_error(code, detail, retryable=retryable)
@@ -440,6 +445,7 @@ class LineAdapter(BasePlatformAdapter):
         tok_hash = hashlib.sha256(self.channel_access_token.encode()).hexdigest()[:16]
         if not self._acquire_platform_lock("line", tok_hash, "LINE channel"):
             return False
+        self._webhook_closing = False
         self._client = _LineClient(self.channel_access_token)
         try:  # best-effort self-userId for self-echo filtering (LINE rarely echoes anyway)
             self._bot_user_id = await self._client.get_bot_user_id()
@@ -481,6 +487,13 @@ class LineAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        self._webhook_closing = True
+        pending = list(self._webhook_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._webhook_tasks.clear()
         self._mark_disconnected()
         for attr, method in (("_site", "stop"), ("_runner", "cleanup")):
             obj = getattr(self, attr)
@@ -515,12 +528,32 @@ class LineAdapter(BasePlatformAdapter):
             payload = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return web.Response(status=400, text="bad json")
-        for event in payload.get("events", []) or []:
+        if not isinstance(payload, dict):
+            return web.Response(status=400, text="bad payload")
+        events = payload.get("events", [])
+        if not isinstance(events, list) or any(not isinstance(x, dict) for x in events):
+            return web.Response(status=400, text="bad events")
+        if self._webhook_closing:
+            # Do not accept work with a success ACK during shutdown.
+            return web.Response(status=503, text="stopping")
+        if events and len(self._webhook_tasks) >= self._webhook_task_limit:
+            # No durable inbox exists here. 503 signals overload rather than
+            # falsely acknowledging work which has not been scheduled.
+            return web.Response(status=503, text="busy")
+        if events:
+            # LINE expects a prompt ACK. The single task preserves intra-payload
+            # ordering and keeps the native approval queue in this owner process.
+            task = asyncio.create_task(self._dispatch_webhook_events(events))
+            self._webhook_tasks.add(task)
+            task.add_done_callback(self._webhook_tasks.discard)
+        return web.Response(status=200, text="ok")
+
+    async def _dispatch_webhook_events(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
             try:
                 await self._dispatch_event(event)
             except Exception:
                 logger.exception("LINE: dispatch_event failed")
-        return web.Response(status=200, text="ok")
 
     async def _dispatch_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
