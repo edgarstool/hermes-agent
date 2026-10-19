@@ -791,6 +791,11 @@ class LineAdapter(BasePlatformAdapter):
             return
         request_id = parsed.get("request_id", "") if parsed.get("action") == "show_response" else ""
         entry = self._cache.get(request_id) if request_id else None
+        # A cached Product View can carry private diagnostic evidence. The
+        # opaque request id is not proof of chat ownership; use the existing
+        # pending-button owner mapping before revealing any cached payload.
+        if entry is not None and self._pending_buttons.get(chat_id) != request_id:
+            entry = None
         if not self._client or not reply_token:
             return
         if entry is None:
@@ -808,7 +813,13 @@ class LineAdapter(BasePlatformAdapter):
             return
         state = entry.state
         if state is State.READY:
-            messages = _text_messages(str(entry.payload or ""))
+            payload = entry.payload
+            if (isinstance(payload, dict) and payload.get("kind") == "line_message"
+                    and isinstance(payload.get("message"), dict)
+                    and payload["message"].get("type") == "flex"):
+                messages = [payload["message"]]
+            else:
+                messages = _text_messages(str(payload or ""))
         elif state is State.ERROR:
             messages = [_text_message(str(entry.payload or self.interrupted_text))]
         else:
@@ -852,11 +863,53 @@ class LineAdapter(BasePlatformAdapter):
             logger.warning("LINE: failed to cache %s payload: %s", msg_type, exc)
             return None, ""
 
+    @staticmethod
+    def _product_view_message(metadata: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        """Validate Amon's exact LINE Flex envelope; otherwise use safe text."""
+        if not isinstance(metadata, dict):
+            return None
+        view = metadata.get("product_view")
+        if (not isinstance(view, dict)
+                or view.get("version") != "edgar.product-view.v0"
+                or view.get("capsule_id") != "server-doctor"):
+            return None
+        message = view.get("line")
+        if not isinstance(message, dict) or message.get("type") != "flex":
+            return None
+        alt = message.get("altText")
+        contents = message.get("contents")
+        if (not isinstance(alt, str) or not alt.strip()
+                or len(alt) > 1500
+                or not isinstance(contents, dict)
+                or contents.get("type") not in {"bubble", "carousel"}):
+            return None
+        # Keep unknown/future payloads from reaching the wire via metadata.
+        # The actual trusted producer is Amon's compile_server_doctor_product_view.
+        try:
+            if len(json.dumps(message, ensure_ascii=False).encode("utf-8")) > 40_000:
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return message
+
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
+        # Amon Product View rides Hermes' existing reply token / push routing.
+        # Interim system notices never turn into interactive cards.
+        flex = None if _is_interim_send(content, metadata) else self._product_view_message(metadata)
+        if flex is not None:
+            pending_rid = self._pending_buttons.get(chat_id)
+            if pending_rid:
+                entry = self._cache.get(pending_rid)
+                if entry is not None and entry.state is State.PENDING:
+                    self._cache.set_ready(pending_rid, {"kind": "line_message", "message": flex})
+                    return SendResult(success=True, message_id=pending_rid)
+                # A stale or fulfilled button cannot swallow this card.
+                self._pending_buttons.pop(chat_id, None)
+            return await self._send_messages(chat_id, [flex])
         # A PENDING postback button caches the response for the tap — except interim /
         # system sends (progress heartbeats, busy-acks), which must land as visible
         # bubbles. Interim detection is purpose-first: the gateway marks every mid-turn
