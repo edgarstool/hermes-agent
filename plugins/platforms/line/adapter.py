@@ -153,6 +153,7 @@ class State(enum.Enum):
 
     PENDING = "pending"  # button sent, LLM still running
     READY = "ready"  # response cached, waiting for postback tap
+    DELIVERING = "delivering"  # one owner-side postback claimed this response
     DELIVERED = "delivered"
     ERROR = "error"  # LLM raised / interrupted; error text cached
 
@@ -192,8 +193,25 @@ class RequestCache:
     def set_error(self, request_id: str, message: str) -> None:
         self._transition(request_id, {State.PENDING}, State.ERROR, message)
 
+    def claim_delivery(self, request_id: str) -> Optional[State]:
+        """Single event-loop atomic claim; does not create another delivery store."""
+        entry = self._entries.get(request_id)
+        if entry is None or entry.state not in (State.READY, State.ERROR):
+            return None
+        previous = entry.state
+        entry.state = State.DELIVERING
+        return previous
+
+    def restore_delivery(self, request_id: str, previous: State) -> None:
+        """A cancelled or rejected LINE send must remain retriable."""
+        if previous not in (State.READY, State.ERROR):
+            return
+        entry = self._entries.get(request_id)
+        if entry is not None and entry.state is State.DELIVERING:
+            entry.state = previous
+
     def mark_delivered(self, request_id: str) -> None:
-        self._transition(request_id, {State.READY, State.ERROR}, State.DELIVERED)
+        self._transition(request_id, {State.READY, State.ERROR, State.DELIVERING}, State.DELIVERED)
 
 
 # LINE source type → (id key, normalized chat_type)
@@ -811,7 +829,8 @@ class LineAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("LINE: postback expired-notice reply failed: %s", exc)
             return
-        state = entry.state
+        state = self._cache.claim_delivery(request_id) or entry.state
+        claimed = entry.state is State.DELIVERING and state in (State.READY, State.ERROR)
         if state is State.READY:
             payload = entry.payload
             if (isinstance(payload, dict) and payload.get("kind") == "line_message"
@@ -824,22 +843,32 @@ class LineAdapter(BasePlatformAdapter):
             messages = [_text_message(str(entry.payload or self.interrupted_text))]
         else:
             messages = [_text_message(self.delivered_text if state is State.DELIVERED else self.pending_text)]
+        delivered = False
         try:
-            await self._client.reply(reply_token, messages)
-        except Exception as exc:
-            if state is not State.READY:
-                if state is State.ERROR:
-                    logger.warning("LINE: postback ERROR reply failed: %s", exc)
-                return
-            logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
             try:
-                await self._client.push(chat_id, messages)
-            except Exception as exc2:
-                logger.error("LINE: postback push fallback failed: %s", exc2)
-                return
-        if state in (State.READY, State.ERROR):
-            self._cache.mark_delivered(request_id)
-            self._pending_buttons.pop(chat_id, None)
+                await self._client.reply(reply_token, messages)
+            except Exception as exc:
+                if state is not State.READY:
+                    if state is State.ERROR:
+                        logger.warning("LINE: postback ERROR reply failed: %s", exc)
+                    return
+                logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
+                try:
+                    await self._client.push(chat_id, messages)
+                except Exception as exc2:
+                    logger.error("LINE: postback push fallback failed: %s", exc2)
+                    return
+            if claimed:
+                self._cache.mark_delivered(request_id)
+                # Do not erase a newer turn's unrelated slow-reply button.
+                if self._pending_buttons.get(chat_id) == request_id:
+                    self._pending_buttons.pop(chat_id, None)
+                delivered = True
+        finally:
+            if claimed and not delivered:
+                # Includes asyncio cancellation: do not strand this card
+                # in DELIVERING after a disconnected webhook task.
+                self._cache.restore_delivery(request_id, state)
 
     async def _download_media(
         self, message_id: str, msg_type: str, *, filename: Optional[str] = None) -> tuple[Optional[str], str]:
