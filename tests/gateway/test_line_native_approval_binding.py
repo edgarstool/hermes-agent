@@ -409,3 +409,90 @@ def test_real_loopback_http_ingress_routes_signed_line_approval_and_rejects_muta
             await runner.cleanup()
 
     asyncio.run(exercise())
+
+
+def test_concurrent_signed_postbacks_exactly_one_native_approval(ready):
+    """Distinct LINE events can race; atomic queue dequeue allows one approval."""
+    from base64 import b64encode
+    from hashlib import sha256
+    from hmac import new as hmac_new
+    from aiohttp import ClientSession, web
+
+    adapter, entry = ready
+
+    async def exercise():
+        actions = await card(adapter)
+        clicked = next(x for x in actions if x["choice"] == "once")
+        app = web.Application()
+        app.router.add_post("/line/webhook", adapter._handle_webhook)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        def signed_body(i):
+            payload = {
+                "events": [
+                    {
+                        **event(clicked),
+                        "webhookEventId": f"concurrent-approval-event-{i}",
+                    }
+                ]
+            }
+            raw = json.dumps(payload, separators=(",", ":")).encode()
+            signature = b64encode(hmac_new(
+                adapter.channel_secret.encode(), raw, sha256
+            ).digest()).decode()
+            return raw, signature
+
+        try:
+            async with ClientSession() as client:
+                async def send(i):
+                    raw, sig = signed_body(i)
+                    async with client.post(
+                        f"http://127.0.0.1:{port}/line/webhook",
+                        data=raw,
+                        headers={"X-Line-Signature": sig},
+                    ) as response:
+                        return response.status
+                statuses = await asyncio.gather(send(1), send(2))
+                assert statuses == [200, 200]
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(exercise())
+    assert entry.result == "once"
+    assert approval.list_gateway_approvals(SESSION) == []
+    assert adapter._client.reply.await_count == 2
+    messages = [str(x.args[1]) for x in adapter._client.reply.await_args_list]
+    assert sum("已核准一次" in x for x in messages) == 1
+    assert sum("已處理或逾時" in x for x in messages) == 1
+
+
+def test_separate_worker_cannot_consume_another_process_approval(ready):
+    """Make cross-process fail-closed boundary explicit, not a distributed PASS."""
+    import os
+    import subprocess
+    import sys
+
+    _adapter, entry = ready
+    assert approval.list_gateway_approvals(SESSION)
+    script = (
+        "import json; from tools.approval import "
+        "list_gateway_approvals, resolve_gateway_approval; "
+        f"session={SESSION!r}; "
+        "print(json.dumps({'found':list_gateway_approvals(session),"
+        "'resolved':resolve_gateway_approval(session,'once',"
+        f"request_id={RID!r})}}))"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(__import__("pathlib").Path(__file__).resolve().parents[2])
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env, capture_output=True, text=True, check=True, timeout=8,
+    )
+    other_worker = json.loads(result.stdout)
+    assert other_worker == {"found": [], "resolved": 0}
+    assert entry.result is None
+    assert approval.list_gateway_approvals(SESSION)[0]["request_id"] == RID

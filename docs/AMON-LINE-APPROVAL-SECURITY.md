@@ -71,3 +71,28 @@ actually starts, then reported 93 PASS / 5 FAIL because the initial workflow
 omitted the repository's optional messaging extra containing aiohttp. The
 branch-scoped workflow now selects the repository's already pinned
 ["messaging"] extra; no runtime code or LINE secret was changed.
+
+## Approval process ownership and concurrent delivery
+
+Two valid, separately signed webhook events for the same request arriving over
+two simultaneous TCP connections may both get HTTP 200 ACK, but only one
+can atomically dequeue the exact native approval; the second receives an
+already-handled notice. The sole owner-side queue item resolves once.
+
+**Important deployment limitation:** tools.approval._gateway_queues is scoped
+to one Python process. Another worker/process has an empty view of the pending
+request and resolve_gateway_approval(session, 'once', request_id=...) returns 0.
+The origin process's request remains pending; remote process does NOT authorize.
+This is a proven safe refusal, NOT a working multi-worker delivery architecture.
+Ingress for a given approval must reach its queue-owning Gateway worker, or a
+future owner-routed approval RPC must be designed, verified and authorized. Do
+not share or replicate approval secrets/queue contents to fix it ad hoc.
+
+Read-only LINE Official API GET verified the currently configured active channel
+is the existing bot (displayName 浩呆), with an active endpoint at
+line-ovh1.edgars.tools/line/webhook. It is NOT an isolated test channel.
+No real test approval was sent to it; existing production service unchanged.
+
+GitHub branch-scoped proof run 39201507826 previously passed 98/98. New
+concurrency/process-boundary tests raise the focused regression scope to 100;
+the new hosted run must be verified separately before declaring CI green.
