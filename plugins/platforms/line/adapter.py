@@ -375,6 +375,46 @@ _LIFECYCLE_EVENTS = frozenset({"follow", "unfollow", "join", "leave"})
 _ENV_SEED_KEYS = (("LINE_PORT", "port", int), ("LINE_HOST", "host", None), ("LINE_PUBLIC_URL", "public_url", None))
 
 
+# The card is a short-lived presentation of the existing Hermes approval queue.
+_LINE_APPROVAL_CARD_TTL = 900.0
+_LINE_APPROVAL_CARD_MAX = 128
+
+
+def build_exec_approval_flex_message(prompt, card_id: str) -> dict[str, Any]:
+    """Use canonical policy choices; never hard-code session/permanent tiers."""
+    buttons = [
+        {
+            "type": "button", "style": "primary" if style == "primary" else "secondary",
+            "action": {
+                "type": "postback", "label": str(label)[:20],
+                "data": json.dumps(
+                    {"action": "exec_approval", "approval_id": card_id, "choice": choice},
+                    separators=(",", ":")),
+                "displayText": str(label)[:20],
+            },
+        }
+        for label, choice, style in prompt.actions
+        if choice in {"once", "session", "always", "deny"}
+    ]
+    return {
+        "type": "flex", "altText": "⚠️ Hermes 操作需要核准",
+        "contents": {
+            "type": "bubble",
+            "body": {
+                "type": "box", "layout": "vertical", "spacing": "md",
+                "contents": [
+                    {"type": "text", "text": "⚠️ Hermes 操作需要核准", "weight": "bold", "wrap": True},
+                    {"type": "text", "text": str(prompt.command or "(空白命令)")[:500], "wrap": True, "size": "sm"},
+                    {"type": "separator"},
+                    {"type": "text", "text": "原因：" + str(prompt.description or "需核准")[:350],
+                     "wrap": True, "size": "sm"},
+                ],
+            },
+            "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": buttons},
+        },
+    }
+
+
 class LineAdapter(BasePlatformAdapter):
     """LINE Messaging API gateway adapter (no message editing → REQUIRES_EDIT_FINALIZE stays False)."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
@@ -424,6 +464,7 @@ class LineAdapter(BasePlatformAdapter):
         self._media_temp_paths: set[str] = set()
         self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
         self._pending_buttons: dict[str, str] = {}  # one outstanding button per chat: chat_id → request_id
+        self._approval_state: dict[str, dict[str, Any]] = {}  # view only; Hermes queue is authority
 
     def _fail(self, code: str, detail: str, *, retryable: bool = False) -> bool:  # fatal connect error → False
         self._set_fatal_error(code, detail, retryable=retryable)
@@ -489,6 +530,7 @@ class LineAdapter(BasePlatformAdapter):
             _unlink_quietly(path)
         self._media_temp_paths.clear()
         self._media_tokens.clear()
+        self._approval_state.clear()  # restart/reconnect invalidates old cards
         with contextlib.suppress(Exception):
             self._release_platform_lock()
 
@@ -583,6 +625,11 @@ class LineAdapter(BasePlatformAdapter):
             parsed = json.loads((event.get("postback") or {}).get("data", "") or "")
         except (TypeError, json.JSONDecodeError):
             return
+        if not isinstance(parsed, dict):
+            return
+        if parsed.get("action") == "exec_approval":
+            await self._handle_exec_approval_postback(parsed, event)
+            return
         request_id = parsed.get("request_id", "") if parsed.get("action") == "show_response" else ""
         entry = self._cache.get(request_id) if request_id else None
         if not self._client or not reply_token:
@@ -623,6 +670,86 @@ class LineAdapter(BasePlatformAdapter):
         if state in (State.READY, State.ERROR):
             self._cache.mark_delivered(request_id)
             self._pending_buttons.pop(chat_id, None)
+
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        """Only a verified DM owner may receive a LINE dangerous-action card."""
+        from tools.approval import list_gateway_approvals
+
+        chat_id = str(prompt.chat_id or "")
+        request_id = str((prompt.metadata or {}).get("_hermes_approval_request_id") or "")
+        if (not self._client or not chat_id.startswith("U")
+                or chat_id not in self.allowed_users
+                or not prompt.session_key.endswith(f":line:dm:{chat_id}")
+                or not request_id):
+            return SendResult(success=False, error="LINE DM owner/request unverified")
+        if not any(p.get("request_id") == request_id
+                   for p in list_gateway_approvals(prompt.session_key)):
+            return SendResult(success=False, error="Hermes approval no longer pending")
+        choices = frozenset(prompt.choices) & {"once", "session", "always", "deny"}
+        if not {"once", "deny"}.issubset(choices):
+            return SendResult(success=False, error="Invalid approval choice policy")
+        now = time.time()
+        for cid, state in list(self._approval_state.items()):
+            if now - state["created_at"] > _LINE_APPROVAL_CARD_TTL:
+                self._approval_state.pop(cid, None)
+        if len(self._approval_state) >= _LINE_APPROVAL_CARD_MAX:
+            self._approval_state.pop(next(iter(self._approval_state)))
+        card_id = secrets.token_hex(16)
+        self._approval_state[card_id] = {
+            "chat_id": chat_id, "owner_id": chat_id, "session_key": prompt.session_key,
+            "request_id": request_id, "choices": choices, "created_at": now,
+        }
+        result = await self._send_messages(
+            chat_id, [build_exec_approval_flex_message(prompt, card_id)])
+        if not result.success:
+            self._approval_state.pop(card_id, None)
+        return result
+
+    async def _handle_exec_approval_postback(self, data: dict[str, Any], event: dict[str, Any]) -> None:
+        """Resolve this exact pending request, never the next FIFO approval."""
+        from tools.approval import list_gateway_approvals, resolve_gateway_approval
+
+        source = event.get("source") or {}
+        card_id, choice = str(data.get("approval_id") or ""), str(data.get("choice") or "")
+        chat_id, chat_type = _resolve_chat(source)
+        sender_id = str(source.get("userId") or "")
+        token = str(event.get("replyToken") or "")
+
+        async def reply(msg: str) -> None:
+            if self._client and token:
+                try:
+                    await self._client.reply(token, [_text_message(msg)])
+                except Exception:
+                    logger.warning("LINE approval notice delivery failed", exc_info=True)
+
+        if set(data) != {"action", "approval_id", "choice"}:
+            await reply("⛔ 無效的核准操作")
+            return
+        state = self._approval_state.get(card_id)
+        if (chat_type != "dm" or not chat_id or sender_id != chat_id
+                or sender_id not in self.allowed_users or state is None
+                or state["chat_id"] != chat_id or state["owner_id"] != sender_id):
+            await reply("⛔ 你無法核准這項操作")
+            return
+        if choice not in state["choices"]:
+            await reply("⛔ 此核准選項不在允許範圍內")
+            return
+        if time.time() - state["created_at"] > _LINE_APPROVAL_CARD_TTL:
+            self._approval_state.pop(card_id, None)
+            await reply("此核准已過期")
+            return
+        key, request_id = state["session_key"], state["request_id"]
+        if not any(p.get("request_id") == request_id for p in list_gateway_approvals(key)):
+            self._approval_state.pop(card_id, None)
+            await reply("此核准已失效")
+            return
+        # No await between consuming card and committing centrally.
+        self._approval_state.pop(card_id, None)
+        settled = resolve_gateway_approval(key, choice, request_id=request_id)
+        await reply(
+            ("❌ 已拒絕" if choice == "deny" else "✅ 已核准") if settled == 1
+            else "此核准已處理或失效"
+        )
 
     async def _download_media(
         self, message_id: str, msg_type: str, *, filename: Optional[str] = None) -> tuple[Optional[str], str]:

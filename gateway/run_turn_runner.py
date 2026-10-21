@@ -653,10 +653,18 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
             try:
+                # LINE needs the exact queue entry for request-bound postback.
+                # Other platform adapters must keep their original metadata shape.
+                approval_metadata = ctx._status_thread_metadata
+                if getattr(getattr(adapter, "platform", None), "value", None) == "line":
+                    approval_metadata = {
+                        **(approval_metadata or {}),
+                        "_hermes_approval_request_id": approval_data.get("request_id", ""),
+                    }
                 fut = self._schedule(
                     adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata, **flags,
+                        description=desc, metadata=approval_metadata, **flags,
                     ),
                     "send_exec_approval scheduling error",
                 )
@@ -713,6 +721,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 raise
             except Exception as e:
                 logger.warning("Button-based approval failed, falling back to text: %s", e)
+        # A LINE chat/group admission is not dangerous-command consent.
+        # Never downgrade an unverified/undeliverable owner-bound card to
+        # text /approve, which could grant authority to a shared room.
+        if getattr(getattr(adapter, "platform", None), "value", None) == "line":
+            raise _ExecApprovalDeclined("LINE approval card unavailable; deny safely")
         # Plain-text prompt with the adapter's typed prefix (e.g. `!approve`): typed "/" is blocked
         # in Slack threads and reserved by Matrix clients.
         msg = _format_exec_approval_fallback(cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)

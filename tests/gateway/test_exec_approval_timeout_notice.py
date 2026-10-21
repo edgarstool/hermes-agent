@@ -130,3 +130,22 @@ def test_other_settle_reasons_post_nothing(pending_entry, reason):
     pending_entry.settle(reason)
 
     assert adapter.edits == [] and adapter.sends == []
+
+
+def test_line_only_receives_exact_approval_request_id_in_metadata(pending_entry):
+    """Bridge passes the real queue request ID to LINE without changing other adapters."""
+    adapter = _ButtonAdapter()
+    adapter.platform = SimpleNamespace(value="line")
+    _runner(adapter)._approval_notify_sync(dict(pending_entry.data))
+    assert adapter.card_metadata == [{
+        "thread_id": "t1",
+        "_hermes_approval_request_id": pending_entry.data["request_id"],
+    }]
+
+
+def test_line_approval_cannot_downgrade_to_group_plaintext(pending_entry):
+    adapter = _PlainAdapter()
+    adapter.platform = SimpleNamespace(value="line")
+    with pytest.raises(RuntimeError, match="LINE approval card unavailable"):
+        _runner(adapter)._approval_notify_sync(dict(pending_entry.data))
+    assert adapter.sends == []
