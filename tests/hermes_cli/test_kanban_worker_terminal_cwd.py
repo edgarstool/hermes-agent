@@ -76,6 +76,7 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["env"]["TERMINAL_CWD"] == str(workspace)
     # The subprocess cwd and TERMINAL_CWD must agree — both anchor the workspace.
     assert captured["cwd"] == str(workspace)
+    assert captured["cmd"][-3:] == ["-P", "-m", "hermes_cli.kanban_worker_client"]
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
