@@ -2430,6 +2430,14 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            # This slot belongs only to the current admitted run; no session-wide
+            # state or model-generated JSON is allowed onto the delivery path.
+            if (isinstance(response, dict) and not response.get("failed")
+                    and not response.get("already_sent")
+                    and turn_ctx._run_still_current()):
+                view = turn_ctx.trusted_product_view_holder[0]
+                if isinstance(view, dict):
+                    response["_trusted_amon_product_view"] = view
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)

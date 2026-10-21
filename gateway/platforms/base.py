@@ -4563,6 +4563,11 @@ class BasePlatformAdapter(ABC):
             with self._media_delivery_scope(event.source):
                 if diagnostic_wake_muted(event):
                     response = None
+            from gateway.amon_trusted_view import trusted_final_metadata
+            # Capture before text/media extraction, which correctly returns
+            # ordinary strings. Inbound metadata must not authorize Flex.
+            _trusted_reply_metadata = trusted_final_metadata(
+                _thread_metadata, response, event.source.platform)
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
@@ -4578,7 +4583,7 @@ class BasePlatformAdapter(ABC):
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata = _mark_notify_metadata(_trusted_reply_metadata)
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
