@@ -449,6 +449,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             agent.stream_delta_callback = None
             agent.interim_assistant_callback = None
             agent.thinking_progress = False
+        # Canonical tool-result -> LINE Product View bridge; never model prose.
+        # The per-turn holder and previous callback are both scoped to this run.
+        from gateway.amon_trusted_view import bind_trusted_line_tool_completion
+        bind_trusted_line_tool_completion(agent, ctx)
         ctx.agent_holder[0] = agent  # interrupt support
         if self._approval_owner is not None:
             authority, owner_id, generation = self._approval_owner

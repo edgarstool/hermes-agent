@@ -509,6 +509,14 @@ class GatewayTurnPersistenceMixin:
                 event._streamed_final_response = str(response or "")
             return None
 
+        # Only the canonical tool-completion bridge may annotate a final LINE
+        # reply. Streaming/failed/silent turns have no trusted rich reply.
+        if (response and str(getattr(source.platform, "value", source.platform)).lower() == "line"
+                and isinstance(agent_result, dict) and not agent_result.get("failed")):
+            view = agent_result.get("_trusted_amon_product_view")
+            if isinstance(view, dict):
+                from gateway.amon_trusted_view import ProductViewReply
+                return ProductViewReply(response, view)
         return response
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
