@@ -1,0 +1,42 @@
+# EDG2-63: current Contabo runtime native request-id security proof.
+# Independent GitHub-hosted CI: no local computer, no third-party paid runner,
+# no LINE credentials, no production deployment.
+name: EDGAR Contabo Native Request Proof
+on:
+  push:
+    branches:
+      - feat/edg2-63-line-native-request-20261104
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edgar-contabo-native-request-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-request-proof:
+    name: LINE owner/request-id and gateway approval regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout verified source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install project locked Python
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          extras: '["messaging"]'
+          cache: 'false'
+      - name: Verify native binding and cross-platform approvals
+        shell: bash
+        env:
+          HERMES_TELEMETRY: 'false'
+        run: |
+          set -euo pipefail
+          test -n "${HERMES_PYTHON:-}"
+          "$HERMES_PYTHON" -m pytest -q \
+            tests/gateway/test_line_native_approval_binding.py \
+            tests/gateway/test_line_plugin.py \
+            tests/gateway/test_approve_deny_commands.py \
+            tests/gateway/test_approval_prompt_redaction.py
