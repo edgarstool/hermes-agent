@@ -518,3 +518,44 @@ def test_metadata_only_id_cannot_replace_native_request_id(ready):
     assert outcome.success is False
     adapter._client.push.assert_not_awaited()
     assert entry.result is None
+
+
+def test_card_creation_rejects_cross_owner_dm_session_even_if_pending(ready):
+    """A destination allowlist cannot authorize another owner's session."""
+    adapter, _entry = ready
+    foreign_session = "agent:main:line:dm:Uother"
+    foreign = _ApprovalEntry({"request_id": RID, "command": "foreign operation"})
+    approval._gateway_queues[foreign_session] = [foreign]
+    try:
+        outcome = asyncio.run(adapter.send_exec_approval(
+            chat_id="Uowner", command="foreign operation",
+            session_key=foreign_session, request_id=RID,
+        ))
+        assert not outcome.success
+        assert foreign.result is None
+        adapter._client.push.assert_not_awaited()
+    finally:
+        approval._gateway_queues.pop(foreign_session, None)
+
+
+def test_validly_signed_misrouted_card_cannot_approve_other_owner(ready):
+    """Even a valid bot HMAC is not proof that session owner matches tapper."""
+    adapter, _entry = ready
+    foreign_session = "agent:main:line:dm:Uother"
+    foreign = _ApprovalEntry({"request_id": RID, "command": "foreign operation"})
+    approval._gateway_queues[foreign_session] = [foreign]
+    try:
+        signed = {
+            "action": "exec_approval",
+            "request_id": RID,
+            "session_key": foreign_session,
+            "choice": "once",
+            "sig": adapter._approval_signature(
+                chat_id="Uowner", session_key=foreign_session,
+                request_id=RID, choice="once",
+            ),
+        }
+        asyncio.run(adapter._handle_postback_event(event(signed, who="Uowner")))
+        assert foreign.result is None
+    finally:
+        approval._gateway_queues.pop(foreign_session, None)
