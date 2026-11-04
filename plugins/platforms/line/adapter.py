@@ -575,6 +575,19 @@ class LineAdapter(BasePlatformAdapter):
             text=text, message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT), source=source_obj,
             raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types))
 
+    @staticmethod
+    def _is_approval_owner_dm_session(session_key: str, chat_id: str) -> bool:
+        """Reject misrouted approval prompts, even when the LINE user is allowlisted.
+
+        Canonical LINE DMs use agent:<profile>:line:dm:<LINE-user-id>.
+        Profile namespaces vary, but the session must belong to this DM.
+        """
+        if not isinstance(session_key, str) or not isinstance(chat_id, str):
+            return False
+        parts = session_key.split(":")
+        return (len(parts) == 5 and parts[0] == "agent" and bool(parts[1])
+                and parts[2] == "line" and parts[3] == "dm" and parts[4] == chat_id)
+
     def _approval_signature(
         self, *, chat_id: str, session_key: str, request_id: str, choice: str
     ) -> str:
@@ -594,7 +607,9 @@ class LineAdapter(BasePlatformAdapter):
         request_id = str(getattr(prompt, "request_id", None) or "")
         if (not self._client or not prompt.chat_id or not self.channel_secret
                 or prompt.chat_id not in self.allowed_users
-                or not request_id or not prompt.session_key):
+                or not request_id
+                or not self._is_approval_owner_dm_session(
+                    prompt.session_key, prompt.chat_id)):
             return SendResult(success=False, error="Native LINE approval identity unavailable")
         if not any(x.get("request_id") == request_id
                    for x in list_gateway_approvals(prompt.session_key)):
@@ -673,6 +688,9 @@ class LineAdapter(BasePlatformAdapter):
                 and request_id and session_key and choice in {"once", "deny"}
                 and len(request_id) <= 128 and len(session_key) <= 256):
             await self._client.reply(token, [_text_message("無效的核准資料")])
+            return
+        if not self._is_approval_owner_dm_session(session_key, chat_id):
+            await self._client.reply(token, [_text_message("核准對話身分不符合")])
             return
         if not self.channel_secret or not re.fullmatch(r"[0-9a-f]{32}", signature):
             await self._client.reply(token, [_text_message("核准身分驗證失敗")])
