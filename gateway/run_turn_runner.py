@@ -784,12 +784,21 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         "exec approval undeliverable: connector egress declined "
                         "this destination"
                     )
+                if getattr(adapter, "requires_bound_exec_approval", False):
+                    raise _ExecApprovalDeclined(
+                        "LINE approval card unavailable; native request_id required; "
+                        "unsafe plaintext approval fallback disabled"
+                    )
                 logger.warning("Button-based approval failed (send returned error), falling back to text")
             except _ExecApprovalDeclined:
                 # Must escape this handler: the fallback below is a text send to
                 # the destination the connector just refused.
                 raise
             except Exception as e:
+                if getattr(adapter, "requires_bound_exec_approval", False):
+                    raise _ExecApprovalDeclined(
+                        "LINE approval card failed; refusing request-id-less text fallback"
+                    ) from e
                 logger.warning("Button-based approval failed, falling back to text: %s", e)
         # Plain-text prompt with the adapter's typed prefix (e.g. `!approve`): typed "/" is blocked
         # in Slack threads and reserved by Matrix clients.
