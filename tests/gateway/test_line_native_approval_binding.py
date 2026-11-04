@@ -559,3 +559,40 @@ def test_validly_signed_misrouted_card_cannot_approve_other_owner(ready):
         assert foreign.result is None
     finally:
         approval._gateway_queues.pop(foreign_session, None)
+
+
+def test_line_send_failure_withdraws_exact_pending_native_approval(ready):
+    """A failed LINE card must leave no pending consent and no text fallback."""
+    from unittest.mock import patch
+    from gateway.run_turn_runner import TurnRunner
+    from tools.approval_gateway_wait import _await_gateway_decision
+
+    adapter, _old_entry = ready
+    separate_session = "agent:failure-test:line:dm:Uowner"
+    adapter._client.push = AsyncMock(side_effect=RuntimeError("simulated LINE transport failure"))
+    runner = _native_runner(adapter)
+    runner._ctx.session_key = separate_session
+    runner._ctx._status_thread_metadata = {}
+
+    def notify(data):
+        TurnRunner._render_approval_sync(runner, data)
+
+    try:
+        with patch.dict("sys.modules", {"gateway.run": _fake_gateway_run_helpers()}), \
+                patch("gateway.run_turn_runner_approval_settle.register_timeout_notice"):
+            result = _await_gateway_decision(
+                separate_session,
+                notify,
+                {"request_id": "req-failed-delivery", "command": "printf test-only",
+                 "description": "Simulated notification", "pattern_keys": []},
+            )
+
+        assert result["resolved"] is False
+        assert result["choice"] is None
+        assert result["notify_failed"] is True
+        assert approval.list_gateway_approvals(separate_session) == []
+        assert approval.resolve_gateway_approval(
+            separate_session, "once", request_id="req-failed-delivery") == 0
+        adapter.send.assert_not_awaited()
+    finally:
+        approval.unregister_gateway_notify(separate_session)
