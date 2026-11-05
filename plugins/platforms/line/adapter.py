@@ -401,6 +401,12 @@ class LineAdapter(BasePlatformAdapter):
         self.public_base_url = (env_or("LINE_PUBLIC_URL", "public_url") or "").rstrip("/")
         self.allow_all = _truthy_env("LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False)))
         self.allowed_users = allowlist("LINE_ALLOWED_USERS", "allowed_users")
+        # Keep normal chat allowlist unchanged. Approval cards require one explicit
+        # canary owner; absent or malformed configuration denies every approval.
+        canary_id = env_or("LINE_APPROVAL_CANARY_USER_ID", "approval_canary_user_id")
+        self.approval_canary_user_id = (
+            canary_id.strip() if isinstance(canary_id, str) else ""
+        )
         self.allowed_groups = allowlist("LINE_ALLOWED_GROUPS", "allowed_groups")
         self.allowed_rooms = allowlist("LINE_ALLOWED_ROOMS", "allowed_rooms")
         # Slow-LLM postback button threshold + user-overridable copy
@@ -607,6 +613,7 @@ class LineAdapter(BasePlatformAdapter):
         request_id = str(getattr(prompt, "request_id", None) or "")
         if (not self._client or not prompt.chat_id or not self.channel_secret
                 or prompt.chat_id not in self.allowed_users
+                or prompt.chat_id != self.approval_canary_user_id
                 or not request_id
                 or not self._is_approval_owner_dm_session(
                     prompt.session_key, prompt.chat_id)):
@@ -670,7 +677,8 @@ class LineAdapter(BasePlatformAdapter):
             return
         authorized = (chat_type == "dm" and chat_id
                       and source.get("userId") == chat_id
-                      and chat_id in self.allowed_users)
+                      and chat_id in self.allowed_users
+                      and chat_id == self.approval_canary_user_id)
         if not authorized:
             await self._client.reply(token, [_text_message("沒有權限核准此操作")])
             return

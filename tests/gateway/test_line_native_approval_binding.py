@@ -19,7 +19,8 @@ def ready():
     adapter = LineAdapter(PlatformConfig(
         enabled=True,
         extra={"channel_access_token": "token", "channel_secret": "a-realistic-test-secret",
-               "allowed_users": ["Uowner", "Uother"]}))
+               "allowed_users": ["Uowner", "Uother"],
+               "approval_canary_user_id": "Uowner"}))
     adapter._client = MagicMock()
     adapter._client.reply = AsyncMock()
     adapter._client.push = AsyncMock()
@@ -596,3 +597,72 @@ def test_line_send_failure_withdraws_exact_pending_native_approval(ready):
         adapter.send.assert_not_awaited()
     finally:
         approval.unregister_gateway_notify(separate_session)
+
+
+def test_approval_canary_disabled_by_default_without_affecting_chat(ready):
+    """No explicit canary target means no dangerous-action approval buttons."""
+    _adapter, entry = ready
+    disabled = LineAdapter(PlatformConfig(
+        enabled=True, extra={
+            "channel_access_token": "token", "channel_secret": "a-realistic-test-secret",
+            "allowed_users": ["Uowner", "Uother"],
+        }))
+    disabled._client = MagicMock()
+    disabled._client.push = AsyncMock()
+    result = asyncio.run(disabled.send_exec_approval(
+        chat_id="Uowner", command="printf synthetic", session_key=SESSION,
+        request_id=RID))
+    assert result.success is False
+    assert entry.result is None
+    disabled._client.push.assert_not_awaited()
+    assert disabled.allowed_users == {"Uowner", "Uother"}
+
+
+def test_other_allowlisted_user_cannot_get_approval_card(ready):
+    """Canary never inherits the entire normal-chat allowlist."""
+    adapter, _original = ready
+    other_key = "agent:main:line:dm:Uother"
+    other_entry = _ApprovalEntry({"request_id": "other-req", "command": "synthetic"})
+    approval._gateway_queues[other_key] = [other_entry]
+    try:
+        result = asyncio.run(adapter.send_exec_approval(
+            chat_id="Uother", command="synthetic", session_key=other_key,
+            request_id="other-req"))
+        assert result.success is False
+        assert other_entry.result is None
+        adapter._client.push.assert_not_awaited()
+    finally:
+        approval._gateway_queues.pop(other_key, None)
+
+
+def test_revoked_canary_cannot_redeem_existing_signed_card(ready):
+    """Changing the target to disabled revokes previously sent approvals."""
+    adapter, entry = ready
+    actions = asyncio.run(card(adapter))
+    adapter.approval_canary_user_id = ""
+    asyncio.run(adapter._handle_postback_event(event(actions[0])))
+    assert entry.result is None
+
+
+def test_other_canary_target_revokes_original_owner_card(ready):
+    """An otherwise valid HMAC must not bypass a changed rollout target."""
+    adapter, entry = ready
+    actions = asyncio.run(card(adapter))
+    adapter.approval_canary_user_id = "Uother"
+    asyncio.run(adapter._handle_postback_event(event(actions[0])))
+    assert entry.result is None
+
+
+def test_noncanary_normal_chat_is_unchanged(ready):
+    """Separating approval rollouts must not disable existing family chat."""
+    adapter, _entry = ready
+    adapter._client = None  # no external LINE API requests in the test
+    adapter.handle_message = AsyncMock()
+    asyncio.run(adapter._handle_message_event({
+        "type": "message", "replyToken": "synthetic-token",
+        "source": {"type": "user", "userId": "Uother"},
+        "message": {"type": "text", "id": "synthetic-msg-2", "text": "您好"},
+    }))
+    assert adapter.allowed_users == {"Uowner", "Uother"}
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text == "您好"

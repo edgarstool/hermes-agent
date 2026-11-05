@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - feat/edg2-63-line-native-request-20261104
+      - fix/edg2-63-line-single-owner-canary-20261104
 
 permissions:
   contents: read
