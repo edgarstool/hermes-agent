@@ -234,18 +234,22 @@ class _LineClient:
         import aiohttp
         return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), trust_env=gateway_trust_env())
 
-    async def _post_messages(self, url: str, label: str, payload: dict[str, Any]) -> None:
+    async def _post_messages(self, url: str, label: str, payload: dict[str, Any]) -> dict:
         async with self._session(self._timeout) as session:
             async with session.post(url, headers=self._headers, json=payload) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE {label} {resp.status}: {body[:200]}")
+                try:
+                    return await resp.json(content_type=None)
+                except Exception:
+                    return {}
 
-    async def reply(self, reply_token: str, messages: list[dict[str, Any]]) -> None:
-        await self._post_messages(LINE_REPLY_URL, "reply", {"replyToken": reply_token, "messages": messages})
+    async def reply(self, reply_token: str, messages: list[dict[str, Any]]) -> dict:
+        return await self._post_messages(LINE_REPLY_URL, "reply", {"replyToken": reply_token, "messages": messages})
 
-    async def push(self, chat_id: str, messages: list[dict[str, Any]]) -> None:
-        await self._post_messages(LINE_PUSH_URL, "push", {"to": chat_id, "messages": messages})
+    async def push(self, chat_id: str, messages: list[dict[str, Any]]) -> dict:
+        return await self._post_messages(LINE_PUSH_URL, "push", {"to": chat_id, "messages": messages})
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -379,6 +383,7 @@ class LineAdapter(BasePlatformAdapter):
     """LINE Messaging API gateway adapter (no message editing → REQUIRES_EDIT_FINALIZE stays False)."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
+    requires_bound_exec_approval: bool = True
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("line"))
@@ -400,6 +405,12 @@ class LineAdapter(BasePlatformAdapter):
         self.public_base_url = (env_or("LINE_PUBLIC_URL", "public_url") or "").rstrip("/")
         self.allow_all = _truthy_env("LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False)))
         self.allowed_users = allowlist("LINE_ALLOWED_USERS", "allowed_users")
+        # Keep normal chat allowlist unchanged. Approval cards require one explicit
+        # canary owner; absent or malformed configuration denies every approval.
+        canary_id = env_or("LINE_APPROVAL_CANARY_USER_ID", "approval_canary_user_id")
+        self.approval_canary_user_id = (
+            canary_id.strip() if isinstance(canary_id, str) else ""
+        )
         self.allowed_groups = allowlist("LINE_ALLOWED_GROUPS", "allowed_groups")
         self.allowed_rooms = allowlist("LINE_ALLOWED_ROOMS", "allowed_rooms")
         # Slow-LLM postback button threshold + user-overridable copy
@@ -574,6 +585,148 @@ class LineAdapter(BasePlatformAdapter):
             text=text, message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT), source=source_obj,
             raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types))
 
+    @staticmethod
+    def _is_approval_owner_dm_session(session_key: str, chat_id: str) -> bool:
+        """Reject misrouted approval prompts, even when the LINE user is allowlisted.
+
+        Canonical LINE DMs use agent:<profile>:line:dm:<LINE-user-id>.
+        Profile namespaces vary, but the session must belong to this DM.
+        """
+        if not isinstance(session_key, str) or not isinstance(chat_id, str):
+            return False
+        parts = session_key.split(":")
+        return (len(parts) == 5 and parts[0] == "agent" and bool(parts[1])
+                and parts[2] == "line" and parts[3] == "dm" and parts[4] == chat_id)
+
+    def _approval_signature(
+        self, *, chat_id: str, session_key: str, request_id: str, choice: str
+    ) -> str:
+        """Bind card to LINE DM, native approval request and exact choice."""
+        if not self.channel_secret:
+            raise ValueError("LINE channel secret missing")
+        body = ("edgar-line-approval:v1:" + json.dumps(
+            [chat_id, session_key, request_id, choice], ensure_ascii=True,
+            separators=(",", ":"))).encode()
+        return hmac.new(self.channel_secret.encode(), body, hashlib.sha256).hexdigest()[:32]
+
+
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        """Buttons consume Hermes' *existing* approval queue, not a LINE shadow ledger."""
+        from tools.approval import list_gateway_approvals
+
+        request_id = str(getattr(prompt, "request_id", None) or "")
+        if (not self._client or not prompt.chat_id or not self.channel_secret
+                or prompt.chat_id not in self.allowed_users
+                or prompt.chat_id != self.approval_canary_user_id
+                or not request_id
+                or not self._is_approval_owner_dm_session(
+                    prompt.session_key, prompt.chat_id)):
+            return SendResult(success=False, error="Native LINE approval identity unavailable")
+        if not any(x.get("request_id") == request_id
+                   for x in list_gateway_approvals(prompt.session_key)):
+            return SendResult(success=False, error="Native LINE approval no longer pending")
+
+        # Only per-operation yes/no. No session-wide/permanent escalation from a button.
+        actions = []
+        for label, choice, _style in prompt.actions:
+            if choice not in {"once", "deny"}:
+                continue
+            data = {
+                "action": "exec_approval", "request_id": request_id,
+                "session_key": prompt.session_key, "choice": choice,
+                "sig": self._approval_signature(
+                    chat_id=prompt.chat_id, session_key=prompt.session_key,
+                    request_id=request_id, choice=choice),
+            }
+            encoded = json.dumps(data, separators=(",", ":"), ensure_ascii=True)
+            if len(encoded.encode("utf-8")) > 300:
+                return SendResult(success=False, error="LINE approval data too long")
+            actions.append({
+                "type": "button", "style": "primary" if choice == "once" else "secondary",
+                "action": {
+                    "type": "postback", "label": str(label)[:20],
+                    "data": encoded, "displayText": "核准一次" if choice == "once" else "拒絕",
+                },
+            })
+        if not actions:
+            return SendResult(success=False, error="No safe approval actions")
+        flex = {
+            "type": "flex", "altText": "Hermes 工具操作需要核准",
+            "contents": {
+                "type": "bubble",
+                "body": {
+                    "type": "box", "layout": "vertical",
+                    "contents": [
+                        {"type": "text", "text": "操作核准", "weight": "bold"},
+                        {"type": "text", "text": str(prompt.text)[:900],
+                         "wrap": True, "size": "sm"},
+                    ],
+                },
+                "footer": {"type": "box", "layout": "vertical", "contents": actions},
+            },
+        }
+        return await self._send_messages(prompt.chat_id, [flex])
+
+
+    async def _handle_exec_approval_postback(
+        self, event: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        """Verify LINE identity+HMAC; atomically consume the exact Hermes queue id."""
+        from tools.approval import list_gateway_approvals, resolve_gateway_approval
+
+        source = event.get("source") or {}
+        chat_id, chat_type = _resolve_chat(source)
+        token = event.get("replyToken", "")
+        if not self._client or not token:
+            return
+        authorized = (chat_type == "dm" and chat_id
+                      and source.get("userId") == chat_id
+                      and chat_id in self.allowed_users
+                      and chat_id == self.approval_canary_user_id)
+        if not authorized:
+            await self._client.reply(token, [_text_message("沒有權限核准此操作")])
+            return
+
+        keys = {"action", "request_id", "session_key", "choice", "sig"}
+        if set(payload) != keys:
+            await self._client.reply(token, [_text_message("無效的核准資料")])
+            return
+        request_id, session_key, choice, signature = (
+            payload.get("request_id"), payload.get("session_key"),
+            payload.get("choice"), payload.get("sig"),
+        )
+        if not (isinstance(request_id, str) and isinstance(session_key, str)
+                and isinstance(signature, str) and isinstance(choice, str)
+                and request_id and session_key and choice in {"once", "deny"}
+                and len(request_id) <= 128 and len(session_key) <= 256):
+            await self._client.reply(token, [_text_message("無效的核准資料")])
+            return
+        if not self._is_approval_owner_dm_session(session_key, chat_id):
+            await self._client.reply(token, [_text_message("核准對話身分不符合")])
+            return
+        if not self.channel_secret or not re.fullmatch(r"[0-9a-f]{32}", signature):
+            await self._client.reply(token, [_text_message("核准身分驗證失敗")])
+            return
+        expected = self._approval_signature(
+            chat_id=chat_id, session_key=session_key,
+            request_id=request_id, choice=choice)
+        if not hmac.compare_digest(signature, expected):
+            await self._client.reply(token, [_text_message("核准身分驗證失敗")])
+            return
+
+        # Fail closed if the prompt timed out or belonged to a different turn.
+        if not any(x.get("request_id") == request_id
+                   for x in list_gateway_approvals(session_key)):
+            await self._client.reply(token, [_text_message("這筆核准已處理或逾時")])
+            return
+        # Native queue resolution is atomic, so duplicate webhook delivery is safe.
+        resolved = resolve_gateway_approval(
+            session_key, choice, request_id=request_id)
+        await self._client.reply(token, [_text_message(
+            ("已核准一次" if choice == "once" else "已拒絕")
+            if resolved == 1 else "這筆核准已處理或逾時")])
+
+
     async def _handle_postback_event(self, event: dict[str, Any]) -> None:
         """User tapped the slow-LLM postback button — deliver the cached payload. READY replies (push
         fallback) and ERROR replies settle the entry; DELIVERED / PENDING just re-issue their notice."""
@@ -582,6 +735,11 @@ class LineAdapter(BasePlatformAdapter):
         try:
             parsed = json.loads((event.get("postback") or {}).get("data", "") or "")
         except (TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(parsed, dict):
+            return
+        if parsed.get("action") == "exec_approval":
+            await self._handle_exec_approval_postback(event, parsed)
             return
         request_id = parsed.get("request_id", "") if parsed.get("action") == "show_response" else ""
         entry = self._cache.get(request_id) if request_id else None
@@ -881,16 +1039,22 @@ class LineAdapter(BasePlatformAdapter):
                 start = 1
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
+        last_push_response = {}
         for i in range(start, len(batches)):  # push the rest (reply token is single-use)
             try:
-                await self._client.push(chat_id, batches[i])
+                last_push_response = await self._client.push(chat_id, batches[i])
             except Exception as exc:
                 if i > 0:
                     logger.warning("LINE: push for follow-up batch failed: %s", exc)
                 elif text:
                     logger.error("LINE: push send failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
-        return SendResult(success=True, message_id=None)
+        # A provider reply is JSON (dict); mocks and alternate clients may
+        # return another object. Delivery succeeded already, so never turn an
+        # unfamiliar receipt shape into a failed LINE message.
+        sent = last_push_response.get("sentMessages") if isinstance(last_push_response, dict) else None
+        message_id = sent[0].get("id") if isinstance(sent, list) and sent and isinstance(sent[0], dict) else None
+        return SendResult(success=True, message_id=message_id, raw_response=last_push_response)
 
 
 def _unlink_quietly(path: str) -> None:
@@ -945,8 +1109,10 @@ async def _standalone_send(
             t("platform.line.standalone.attachments_not_deliverable", count=str(len(media_files)))))
         messages = messages[:LINE_MAX_MESSAGES_PER_CALL]
     try:
-        await _LineClient(token).push(chat_id, messages)
-        return {"success": True, "message_id": None}
+        resp = await _LineClient(token).push(chat_id, messages)
+        sent = (resp or {}).get("sentMessages") or []
+        message_id = sent[0].get("id") if sent else None
+        return {"success": True, "message_id": message_id, "raw_response": resp}
     except Exception as exc:
         return send_error(str(exc))
 
