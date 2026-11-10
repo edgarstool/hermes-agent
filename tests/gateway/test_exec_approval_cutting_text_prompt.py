@@ -88,7 +88,7 @@ def pending():
         approval._gateway_queues.clear()
 
 
-@pytest.mark.parametrize("make", [_ntfy, _dingtalk, _photon, _line], ids=["ntfy", "dingtalk", "photon", "line"])
+@pytest.mark.parametrize("make", [_ntfy, _dingtalk, _photon], ids=["ntfy", "dingtalk", "photon"])
 def test_long_command_keeps_instructions_and_offers_only_deny(make, pending):
     adapter, wire = make()
     adapter.pause_typing_for_chat = lambda _c: None
@@ -101,7 +101,7 @@ def test_long_command_keeps_instructions_and_offers_only_deny(make, pending):
     assert approval.resolve_gateway_approval_card(SESSION, "once", "r1") == 0  # a crafted approve resolves nothing
 
 
-@pytest.mark.parametrize("make", [_ntfy, _dingtalk, _photon, _line], ids=["ntfy", "dingtalk", "photon", "line"])
+@pytest.mark.parametrize("make", [_ntfy, _dingtalk, _photon], ids=["ntfy", "dingtalk", "photon"])
 def test_short_command_is_shown_whole_with_every_choice(make, pending):
     adapter, wire = make()
     adapter.pause_typing_for_chat = lambda _c: None
@@ -129,7 +129,7 @@ def test_a_long_backtick_run_never_leaves_the_fence_open_past_the_cut(command, p
     assert pending.card_deny_only is True
 
 
-@pytest.mark.parametrize("make", [_photon, _ntfy, _line], ids=["photon", "ntfy", "line"])
+@pytest.mark.parametrize("make", [_photon, _ntfy], ids=["photon", "ntfy"])
 def test_command_that_fits_only_beside_deny_is_shown_whole_and_not_called_shortened(make, pending):
     """One character too long for every choice, short enough for Deny alone: the whole command is
     shown, only Deny is offered, and the notice says why instead of claiming a shortened preview."""
@@ -143,3 +143,19 @@ def test_command_that_fits_only_beside_deny_is_shown_whole_and_not_called_shorte
     assert "\n" + command in delivered and "/approve" not in delivered and "/deny" in delivered
     assert "Preview shortened" not in delivered and "only Deny is offered" in delivered
     assert pending.card_deny_only is True
+
+
+@pytest.mark.parametrize("command", [
+    "echo " + "A" * 30000 + " " + TAIL,
+    "rm -rf /tmp/x " + TAIL,
+    TAIL,
+], ids=["long", "short", "deny-fit"])
+def test_line_never_falls_back_to_unsigned_plaintext_approval(command, pending):
+    """A LINE card without bound owner/request ID must fail closed, not send /approve."""
+    from gateway.run_turn_runner import _ExecApprovalDeclined
+
+    adapter, wire = _line()
+    adapter.pause_typing_for_chat = lambda _chat: None
+    with pytest.raises(_ExecApprovalDeclined, match="LINE approval card unavailable"):
+        _render(adapter, command)
+    assert wire == []
