@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -43,7 +44,10 @@ def _dingtalk():
 
 def _photon():
     from plugins.platforms.photon.adapter import PhotonAdapter
-    a = PhotonAdapter(PlatformConfig(enabled=True, extra={}))
+    # Rendering tests do not need Photon Node discovery; isolate from runner HOME.
+    # CI regression: setup-pm/manifest.json was read under the real runner home.
+    with patch("plugins.platforms.photon.adapter.find_node_executable", return_value="node"):
+        a = PhotonAdapter(PlatformConfig(enabled=True, extra={}))
     wire = []
 
     async def post_send(path, body, **_k):
